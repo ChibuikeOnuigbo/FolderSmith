@@ -18,7 +18,7 @@ from PyQt6.QtCore import (
     QThread,
     pyqtSignal,
     QParallelAnimationGroup,
-    QPoint,
+    QPoint,QEvent, QTimer
 )
 from PyQt6.QtGui import (
     QFont,
@@ -31,7 +31,7 @@ from PyQt6.QtGui import (
     QGuiApplication,
     QCursor,
     QPixmap,
-    QPainter,
+    QPainter,QGuiApplication
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -60,8 +60,50 @@ from PyQt6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHeaderView,
     QTableWidget,
-    QTableWidgetItem,
+    QTableWidgetItem
 )
+
+
+class PopupComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._swallow_release = False
+        self._popup = None
+
+    def showPopup(self):
+        super().showPopup()
+        self._popup = self.view().window()
+        if self._popup is not None:
+            # Install event filter to catch the first release
+            self._popup.installEventFilter(self)
+            self._swallow_release = True
+            # Schedule the move to happen after the popup is shown
+            QTimer.singleShot(0, self._move_popup)
+
+    def _move_popup(self):
+        if self._popup is None:
+            return
+        target = self.mapToGlobal(QPoint(0, self.height()))
+        screen = self.screen() if hasattr(self, "screen") else QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            if target.y() + self._popup.height() > avail.bottom():
+                target.setY(self.mapToGlobal(QPoint(0, 0)).y() - self._popup.height())
+            target.setX(min(max(target.x(), avail.left()), avail.right() - self._popup.width()))
+        self._popup.move(target)
+        self._popup.resize(max(self.width(), self._popup.width()), self._popup.height())
+        # After a short grace period, stop swallowing releases
+        QTimer.singleShot(200, self._clear_swallow)
+
+    def _clear_swallow(self):
+        self._swallow_release = False
+
+    def eventFilter(self, obj, event):
+        if obj is self._popup and event.type() == QEvent.Type.MouseButtonRelease:
+            if self._swallow_release:
+                # Swallow this release so it doesn't close the popup
+                return True
+        return super().eventFilter(obj, event)
 
 
 def beep(freq, duration):
@@ -139,6 +181,22 @@ def make_emoji_icon(emoji, size=28):
     painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), emoji)
     painter.end()
     return QIcon(pixmap)
+
+
+_ICON_CACHE = {}
+
+
+def get_cached_icon(emoji, size=28):
+    """Same as make_emoji_icon, but built once and reused. Building a
+    QPixmap+QPainter per tree row was a big chunk of the lag on large
+    previews, since the same handful of emoji (folder/file icons) get
+    drawn thousands of times over."""
+    key = (emoji, size)
+    icon = _ICON_CACHE.get(key)
+    if icon is None:
+        icon = make_emoji_icon(emoji, size)
+        _ICON_CACHE[key] = icon
+    return icon
 
 
 #come back here later
@@ -317,6 +375,324 @@ def verify_on_disk(root_path, root_node):
 
     walk(root_node, root_path)
     return missing
+
+
+# ---------------------------------------------------------------------------
+# Folder -> project structure. This is FolderSmith's other core direction:
+# instead of typing a structure and creating real folders from it, point it
+# at a real folder on disk and it scans that folder into the same Node tree
+# the rest of the app already understands - so the preview, Deep Dive, and
+# text export all work on a scanned folder exactly like they do on typed
+# text. Scanning always happens on a background thread (FolderScanWorker
+# below) so importing a large folder never freezes the UI.
+# ---------------------------------------------------------------------------
+class FolderTooLargeError(Exception):
+    pass
+
+
+DEFAULT_SKIP_ENTRIES = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv", ".idea",
+    ".vscode", ".mypy_cache", ".pytest_cache", ".DS_Store", "dist",
+    "build", ".next", ".pytest_cache",
+}
+MAX_IMPORT_NODES = 20000
+LAZY_LOAD_THRESHOLD = 150  # nodes; above this, the preview tree populates on-demand
+
+
+def build_tree_from_folder(root_path, skip_entries=None, should_cancel=None, on_progress=None):
+    """Walk a real folder on disk into a Node tree. Runs entirely on a
+    worker thread. `should_cancel` is polled periodically so a scan of a
+    huge folder can be aborted instantly instead of blocking shutdown.
+    `on_progress(count)` is called every ~200 items so the status bar can
+    show live progress without flooding the Qt event queue with signals.
+    """
+    skip_entries = skip_entries if skip_entries is not None else DEFAULT_SKIP_ENTRIES
+    root_name = os.path.basename(os.path.normpath(root_path)) or root_path
+    root = Node(name=root_name, is_folder=True, depth=0)
+    count = 0
+
+    def walk(node, path, depth):
+        nonlocal count
+        if should_cancel and should_cancel():
+            return
+        try:
+            entries = sorted(
+                os.scandir(path),
+                key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()),
+            )
+        except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+            return
+        for entry in entries:
+            if should_cancel and should_cancel():
+                return
+            if entry.name in skip_entries:
+                continue
+            count += 1
+            if count > MAX_IMPORT_NODES:
+                raise FolderTooLargeError(
+                    f"This folder has more than {MAX_IMPORT_NODES:,} items.\n"
+                    "Pick a smaller or more specific folder to import."
+                )
+            if on_progress and count % 200 == 0:
+                on_progress(count)
+            is_dir = entry.is_dir(follow_symlinks=False)
+            child = Node(name=entry.name, is_folder=is_dir, depth=depth + 1)
+            child.parent = node
+            node.children.append(child)
+            if is_dir:
+                walk(child, entry.path, depth + 1)
+
+    walk(root, root_path, 0)
+    return root, count
+
+
+class FolderScanWorker(QThread):
+    """Scans a folder on a background thread. Keeping this off the GUI
+    thread is what fixes the old lag/"Not Responding" freeze on big
+    imports - the disk walk never blocks Qt's event loop."""
+
+    progress = pyqtSignal(int)
+    completed = pyqtSignal(object)  # (wrapper_root_node, item_count)
+    error = pyqtSignal(str)
+
+    def __init__(self, folder_path):
+        super().__init__()
+        self.folder_path = folder_path
+        self._canceled = False
+
+    def cancel(self):
+        self._canceled = True
+
+    def _is_canceled(self):
+        return self._canceled
+
+    def run(self):
+        try:
+            scanned_root, count = build_tree_from_folder(
+                self.folder_path,
+                should_cancel=self._is_canceled,
+                on_progress=self.progress.emit,
+            )
+        except FolderTooLargeError as e:
+            self.error.emit(str(e))
+            return
+        except Exception as e:
+            self.error.emit(f"Could not read that folder:\n{e}")
+            return
+
+        if self._canceled:
+            return
+
+        # Wrap so it has the same shape as parse_structure()'s synthetic
+        # root (a root whose children are the top-level items) - this lets
+        # every renderer/consumer in the app treat a scanned folder exactly
+        # like typed text.
+        wrapper = Node(name="", is_folder=True, depth=-1)
+        scanned_root.parent = wrapper
+        wrapper.children = [scanned_root]
+        self.completed.emit((wrapper, count))
+
+
+# ---------------------------------------------------------------------------
+# Rendering a Node tree back to text, in either of the two project-tree
+# styles people commonly use. Both directions (typed text -> tree, and
+# folder scan -> tree) funnel through the SAME render functions, so the
+# "Tree style" toggle affects a pasted structure and an imported folder
+# identically.
+# ---------------------------------------------------------------------------
+STYLE_TREE_DIAGRAM = "tree"
+STYLE_PLAIN_INDENT = "indent"
+
+
+def render_structure_text(root_node, style, indent_unit=2):
+    if style == STYLE_PLAIN_INDENT:
+        return _render_plain_indent(root_node, indent_unit)
+    return _render_tree_diagram(root_node)
+
+
+def _render_plain_indent(root_node, indent_unit=2):
+    lines = []
+
+    def walk(node, depth):
+        for child in node.children:
+            pad = " " * (depth * indent_unit)
+            name = child.name + ("/" if child.is_folder else "")
+            if child.comment:
+                # child.comment already includes its own marker (#, //,
+                # /* */, <!-- -->, ...) from strip_comment(), so it's
+                # appended as-is - prefixing another "# " here would double
+                # up the marker (e.g. "# // Core functionality").
+                lines.append(f"{pad}{name}  {child.comment}")
+            else:
+                lines.append(f"{pad}{name}")
+            if child.is_folder:
+                walk(child, depth + 1)
+
+    walk(root_node, 0)
+    return "\n".join(lines)
+
+
+def _render_tree_diagram(root_node):
+    """Render as an ASCII tree diagram. Top-level item(s) are written bare
+    (no ├──/└── glyph) - the same convention a hand-written diagram or the
+    `tree` command uses, where the very first line is just the root name
+    and only its *nested* children get connector glyphs. Only descendants
+    (depth >= 1) are prefixed."""
+    lines = []
+
+    def walk(node, prefix):
+        children = node.children
+        for i, child in enumerate(children):
+            is_last = i == len(children) - 1
+            connector = "└── " if is_last else "├── "
+            name = child.name + ("/" if child.is_folder else "")
+            line = prefix + connector + name
+            if child.comment:
+                # See _render_plain_indent: comment already carries its own
+                # marker, so don't prefix another "# " here.
+                line += f"  {child.comment}"
+            lines.append(line)
+            if child.is_folder:
+                extension = "    " if is_last else "│   "
+                walk(child, prefix + extension)
+
+    for top in root_node.children:
+        name = top.name + ("/" if top.is_folder else "")
+        line = name
+        if top.comment:
+            line += f"  {top.comment}"
+        lines.append(line)
+        if top.is_folder:
+            walk(top, "")
+
+    return "\n".join(lines)
+
+
+# The full annotated example that demonstrates every supported comment
+# style (#, //, /* */, <!-- -->) and multi-level nesting. Defined once here
+# so both the "Load Sample" menu action and the Preset dropdown show the
+# exact same text - picking either one can never disagree with the other.
+SAMPLE_STRUCTURE = """# FolderSmith Pro Sample Structure
+project_root/
+├── app/
+│   ├── __init__.py
+│   ├── main.py  # Main application entry point
+│   ├── core/
+│   │   ├── __init__.py
+│   │   └── logic.py  // Core functionality
+│   └── utils/
+│       ├── __init__.py
+│       ├── helpers.py  /* Utility functions */
+│       └── validators.py
+├── tests/
+│   ├── unit/
+│   │   └── test_core.py
+│   └── integration/
+│       └── test_app.py
+├── docs/
+│   ├── index.html  <!-- Documentation home -->
+│   └── style.css
+├── data/
+│   ├── input/
+│   └── output/
+├── config/
+│   └── settings.json  // Configuration settings
+├── requirements.txt  # Dependencies
+├── README.md  /* Project documentation */
+└── .gitignore
+"""
+
+# Ready-made project structures - no AI, no network, no API key. Picking
+# one just fills the input with well-known layouts for common project types.
+PRESET_STRUCTURES = {
+    "Sample (all comment styles)": SAMPLE_STRUCTURE,
+    "Python Package": (
+        "my_package/\n"
+        "  my_package/\n"
+        "    __init__.py\n"
+        "    core.py\n"
+        "  tests/\n"
+        "    test_core.py\n"
+        "  pyproject.toml\n"
+        "  README.md\n"
+        "  .gitignore\n"
+    ),
+    "Flask Web App": (
+        "flask_app/\n"
+        "  app/\n"
+        "    __init__.py\n"
+        "    routes.py\n"
+        "    models.py\n"
+        "    templates/\n"
+        "      index.html\n"
+        "    static/\n"
+        "      css/\n"
+        "      js/\n"
+        "  tests/\n"
+        "    test_app.py\n"
+        "  requirements.txt\n"
+        "  .env\n"
+        "  .gitignore\n"
+        "  README.md\n"
+    ),
+    "React App": (
+        "react_app/\n"
+        "  public/\n"
+        "    index.html\n"
+        "  src/\n"
+        "    components/\n"
+        "    App.jsx\n"
+        "    index.jsx\n"
+        "  package.json\n"
+        "  .gitignore\n"
+        "  README.md\n"
+    ),
+    "Flutter App": (
+        "flutter_app/\n"
+        "  lib/\n"
+        "    main.dart\n"
+        "    screens/\n"
+        "    widgets/\n"
+        "  assets/\n"
+        "    images/\n"
+        "  test/\n"
+        "  pubspec.yaml\n"
+        "  README.md\n"
+    ),
+    "Node/Express API": (
+        "express_api/\n"
+        "  src/\n"
+        "    routes/\n"
+        "    controllers/\n"
+        "    models/\n"
+        "    index.js\n"
+        "  tests/\n"
+        "  package.json\n"
+        "  .env\n"
+        "  .gitignore\n"
+        "  README.md\n"
+    ),
+    "Data Science Project": (
+        "ds_project/\n"
+        "  data/\n"
+        "    raw/\n"
+        "    processed/\n"
+        "  notebooks/\n"
+        "  src/\n"
+        "    __init__.py\n"
+        "  models/\n"
+        "  requirements.txt\n"
+        "  README.md\n"
+    ),
+    "Empty Project": (
+        "new_project/\n"
+        "  src/\n"
+        "  docs/\n"
+        "  tests/\n"
+        "  README.md\n"
+        "  .gitignore\n"
+    ),
+}
 
 
 # Custom syntax highlighter for the folder structure input box
@@ -602,34 +978,29 @@ class DeepDiveDialog(QDialog):
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        table.setAlternatingRowColors(True)
+        table.setAlternatingRowColors(False)
         table.setWordWrap(True)
 
-        tag_colors = {
-            "ROOT FOLDER": "#2E7D32",
-            "SUBFOLDER": "#1565C0",
-            "FILE": "#546E7A",
-        }
+        # Deliberately just two accent colors plus the existing comment
+        # color (3 total) - everything else in the table stays plain text
+        # in the default foreground. Folders and files are told apart by
+        # color alone on the Type column; no pill/badge shapes, no
+        # per-extension rainbow, no striped rows.
+        FOLDER_ACCENT = "#59A5D8"
+        FILE_ACCENT = "#D9A15B"
 
         for r, (tag, name, path, comment, depth) in enumerate(rows):
-            pill = QLabel(tag)
-            pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            pill.setStyleSheet(
-                f"background-color: {tag_colors[tag]}; color: white; "
-                "border-radius: 8px; padding: 3px 8px; font-weight: bold; font-size: 11px;"
-            )
-            cell_wrap = QWidget()
-            cell_layout = QHBoxLayout(cell_wrap)
-            cell_layout.setContentsMargins(6, 2, 6, 2)
-            cell_layout.addWidget(pill)
-            cell_layout.addStretch()
-            table.setCellWidget(r, 0, cell_wrap)
+            accent = FOLDER_ACCENT if tag != "FILE" else FILE_ACCENT
+
+            tag_item = QTableWidgetItem(tag)
+            tag_font = tag_item.font()
+            tag_font.setBold(True)
+            tag_item.setFont(tag_font)
+            tag_item.setForeground(QColor(accent))
+            table.setItem(r, 0, tag_item)
 
             name_item = QTableWidgetItem(("    " * depth) + name)
-            if tag == "FILE":
-                name_item.setForeground(QColor(get_file_color(name)))
-            else:
-                name_item.setForeground(QColor(get_folder_color(depth)))
+            name_item.setForeground(QColor(accent))
             table.setItem(r, 1, name_item)
 
             table.setItem(r, 2, QTableWidgetItem(path))
@@ -648,14 +1019,15 @@ class DeepDiveDialog(QDialog):
         table.setColumnWidth(1, 200)
         table.setColumnWidth(3, 220)
 
-        bg = "#252525"
-        fg = "#F1F1F1"
-        grid = "#3D3D40"
-        header_bg = "#3D3D40"
+        bg = "#1B1B1B"
+        fg = "#E8E8E8"
+        grid = "#333333"
+        header_bg = "#242424"
         table.setStyleSheet(
             f"QTableWidget {{ background-color: {bg}; color: {fg}; gridline-color: {grid}; "
             f"border: 1px solid {grid}; }}"
-            f"QTableWidget::item:selected {{ background-color: #0078D7; color: white; }}"
+            f"QTableWidget::item {{ background-color: transparent; }}"
+            f"QTableWidget::item:selected {{ background-color: #3A3A3A; color: {fg}; }}"
             f"QHeaderView::section {{ background-color: {header_bg}; color: {fg}; "
             f"padding: 6px; border: none; font-weight: bold; }}"
         )
@@ -689,9 +1061,11 @@ class FolderSmithPro(QMainWindow):
         self.setMinimumSize(1000, 700)
 
         self.tree_diagram_detected = False
+        self.tree_style = STYLE_TREE_DIAGRAM
 
         self.structure_worker = None
         self.zip_worker = None
+        self.scan_worker = None
 
         self.init_ui()
         self.apply_theme()
@@ -756,13 +1130,71 @@ class FolderSmithPro(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        input_label = QLabel("Enter your project structure:")
+        input_label = QLabel("Project Structure")
         input_label.setStyleSheet("font-weight: bold; font-size: 14px;")
         left_layout.addWidget(input_label)
+
+        subtitle = QLabel(
+            "Import a real folder to turn it into a project structure, or "
+            "type/paste one below and create the real folders from it."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #9AA0A6; font-size: 12px;")
+        left_layout.addWidget(subtitle)
+
+        # Source row - this is the primary "folder -> project structure"
+        # entry point, so it sits above the text box, not buried below it.
+        source_row = QHBoxLayout()
+        source_row.setSpacing(10)
+
+        self.import_folder_btn = QPushButton("Import Folder…")
+        self.import_folder_btn.setIcon(make_emoji_icon("📥"))
+        self.import_folder_btn.setToolTip(
+            "Scan a real folder on disk and turn it into a project structure"
+        )
+        self.import_folder_btn.setStyleSheet(
+            "QPushButton { "
+            "background-color: #E08E45; "
+            "color: #1E1E1E; "
+            "font-weight: bold; "
+            "padding: 8px 14px; "
+            "border: none; "
+            "border-radius: 4px; "
+            "}"
+            "QPushButton:hover { background-color: #EFA968; }"
+            "QPushButton:disabled { background-color: #888888; }"
+        )
+        self.import_folder_btn.clicked.connect(self.import_folder)
+        self.import_folder_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        source_row.addWidget(self.import_folder_btn)
+
+        preset_label = QLabel("Preset:")
+        source_row.addWidget(preset_label)
+
+        self.preset_combo = PopupComboBox()
+        # self.preset_combo = QComboBox()
+        self.preset_combo.addItem("Choose a preset…")
+        self.preset_combo.addItems(sorted(PRESET_STRUCTURES.keys()))
+        self.preset_combo.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.preset_combo.activated.connect(self.load_selected_preset)
+        source_row.addWidget(self.preset_combo, 1)
+
+        style_label = QLabel("Tree style:")
+        source_row.addWidget(style_label)
+
+        self.tree_style_combo = PopupComboBox()
+        self.tree_style_combo.addItem("Tree diagram (├── └──)", STYLE_TREE_DIAGRAM)
+        self.tree_style_combo.addItem("Plain indented", STYLE_PLAIN_INDENT)
+        self.tree_style_combo.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.tree_style_combo.currentIndexChanged.connect(self.on_tree_style_changed)
+        source_row.addWidget(self.tree_style_combo)
+
+        left_layout.addLayout(source_row)
 
         self.input_text = QTextEdit()
         self.input_text.setPlaceholderText(
             "📁 Enter your project structure (folders must end with '/')\n"
+            "Or click 'Import Folder…' above to generate this from a real folder.\n"
             "\n"
             " Guidelines:\n"
             "- Use spaces or tree diagrams to represent indentation.\n"
@@ -911,6 +1343,8 @@ class FolderSmithPro(QMainWindow):
         self.tree_widget.setHeaderLabels(["Structure", "Comment"])
         self.tree_widget.setWordWrap(True)
         self.tree_widget.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.tree_widget.setUniformRowHeights(True)
+        self.tree_widget.itemExpanded.connect(self._on_tree_item_expanded)
         right_layout.addWidget(self.tree_widget, 1)
 
         preview_controls = QHBoxLayout()
@@ -918,7 +1352,7 @@ class FolderSmithPro(QMainWindow):
         folder_label = QLabel("Root Folder:")
         preview_controls.addWidget(folder_label)
 
-        self.folder_combo = QComboBox()
+        self.folder_combo = PopupComboBox()
         self.folder_combo.addItems(
             [
                 os.path.join(os.path.expanduser("~"), "FolderSmith"),
@@ -936,11 +1370,11 @@ class FolderSmithPro(QMainWindow):
             "QPushButton { "
             "background-color: #3D3D40; "
             "color: #F1F1F1; "
-            "padding: 5px; "
-            "border: 1px solid #555; "
+            "padding: 6px 12px; "
+            "border: none; "
             "border-radius: 4px;"
             "}"
-            "QPushButton:hover { background-color: #0078D7; }"
+            "QPushButton:hover { background-color: #7C6FA6; }"
         )
         browse_btn.clicked.connect(self.browse_folder)
         browse_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -1014,6 +1448,11 @@ class FolderSmithPro(QMainWindow):
 
         tools_menu = menu_bar.addMenu("&Tools")
 
+        import_action = QAction("&Import Folder...", self)
+        import_action.setShortcut("Ctrl+I")
+        import_action.triggered.connect(self.import_folder)
+        tools_menu.addAction(import_action)
+
         deepdive_action = QAction("&Deep Dive...", self)
         deepdive_action.triggered.connect(self.open_deep_dive)
         tools_menu.addAction(deepdive_action)
@@ -1040,7 +1479,12 @@ class FolderSmithPro(QMainWindow):
         palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
         palette.setColor(QPalette.ColorRole.ButtonText, QColor(241, 241, 241))
         palette.setColor(QPalette.ColorRole.BrightText, QColor(244, 67, 54))
-        palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 120, 215))
+        # A softened purple accent - used for selection/highlight states
+        # everywhere (tree rows, combo dropdowns, menus) instead of a
+        # bright saturated purple, per feedback that the old highlight
+        # was too bright.
+        accent = "#7C6FA6"
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(accent))
         palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
 
         input_bg, input_fg, border = "#1E1E1E", "#F1F1F1", "#555555"
@@ -1057,10 +1501,15 @@ class FolderSmithPro(QMainWindow):
                 border: 1px solid {border};
                 border-radius: 5px;
                 padding: 5px;
+                selection-background-color: {accent};
+                selection-color: white;
             }}
         """
         )
 
+        # Selection covers the branch (expand-arrow) column too, so a
+        # selected row reads as one flat highlighted bar instead of a
+        # highlight block that looks indented/bordered next to the arrow.
         self.tree_widget.setStyleSheet(
             f"""
             QTreeWidget {{
@@ -1068,9 +1517,11 @@ class FolderSmithPro(QMainWindow):
                 color: {tree_fg};
                 border: 1px solid {border};
                 border-radius: 5px;
+                outline: 0;
             }}
-            QTreeWidget::item {{ padding: 4px; }}
-            QTreeWidget::item:selected {{ background-color: #0078D7; color: white; }}
+            QTreeWidget::item {{ padding: 4px; border: none; }}
+            QTreeWidget::item:selected {{ background-color: {accent}; color: white; }}
+            QTreeWidget::branch:selected {{ background-color: {accent}; }}
             QHeaderView::section {{
                 background-color: {header_bg};
                 color: {tree_fg};
@@ -1081,34 +1532,108 @@ class FolderSmithPro(QMainWindow):
         """
         )
 
-        self.folder_combo.setStyleSheet(
-            f"""
-            QComboBox {{
-                background-color: {input_bg}; color: {input_fg};
-                border: 1px solid {border}; border-radius: 4px; padding: 5px;
+        # Same flat treatment (background + radius, no visible border) on
+        # every button/combo that shares a row, so a button sitting next
+        # to a combo box never looks like a mismatched extra element.
+        flat_control = f"""
+            QPushButton {{
+                background-color: {header_bg}; color: {input_fg};
+                border: none; border-radius: 4px; padding: 6px 12px;
             }}
-            QComboBox::drop-down {{ border: none; }}
+            QPushButton:hover {{ background-color: {accent}; }}
+            QPushButton:disabled {{ background-color: #2A2A2C; color: #777; }}
+            QComboBox {{
+                background-color: {header_bg}; color: {input_fg};
+                border: none; border-radius: 4px; padding: 5px 8px;
+            }}
+            QComboBox:hover {{ background-color: #46464A; }}
+            QComboBox::drop-down {{ border: none; width: 20px; background: transparent; }}
             QComboBox QAbstractItemView {{
                 background-color: {input_bg}; color: {input_fg};
-                selection-background-color: #0078D7;
+                border: 1px solid {border};
+                selection-background-color: {accent};
+                selection-color: white;
+                outline: 0;
             }}
         """
-        )
+        for widget in (self.preset_combo, self.tree_style_combo, self.folder_combo):
+            widget.setStyleSheet(flat_control)
 
         self.menuBar().setStyleSheet(
             f"""
             QMenuBar {{ background-color: {header_bg}; color: {tree_fg}; padding: 5px; }}
             QMenuBar::item {{ background-color: transparent; padding: 5px 10px; }}
-            QMenuBar::item:selected {{ background-color: #0078D7; color: white; }}
+            QMenuBar::item:selected {{ background-color: {accent}; color: white; }}
             QMenu {{ background-color: {tree_bg}; color: {tree_fg}; border: 1px solid {border}; }}
             QMenu::item {{ padding: 5px 30px 5px 20px; }}
-            QMenu::item:selected {{ background-color: #0078D7; color: white; }}
+            QMenu::item:selected {{ background-color: {accent}; color: white; }}
             QMenu::separator {{ height: 1px; background-color: {border}; }}
         """
         )
 
         # Re-render the preview so file/folder/comment colors stay in sync.
         self.update_preview()
+
+    # --- Preview tree building --------------------------------------------
+    # Below LAZY_LOAD_THRESHOLD nodes, the whole tree is built and expanded
+    # up front - nicest for typical hand-typed structures. Above it (a big
+    # imported folder), only the visible level is ever realized as real
+    # QTreeWidgetItems; each folder gets a single "Loading…" placeholder
+    # that's swapped for its real children only when the user expands it.
+    # This is what keeps a huge import from freezing the UI: Qt never has
+    # to construct/lay out thousands of widget rows it doesn't need yet.
+    _LAZY_TAG = "__lazy_placeholder__"
+
+    def _build_item_for_node(self, node):
+        item = QTreeWidgetItem()
+        item.setText(0, node.name)
+        if node.is_folder:
+            item.setIcon(0, get_cached_icon("📂"))
+            item.setForeground(0, QColor(get_folder_color(node.depth)))
+        else:
+            item.setIcon(0, get_cached_icon("📄"))
+            item.setForeground(0, QColor(get_file_color(node.name)))
+
+        if node.comment:
+            item.setText(1, node.comment)
+            item.setForeground(1, QColor(COMMENT_COLOR))
+            comment_font = item.font(1)
+            comment_font.setItalic(True)
+            item.setFont(1, comment_font)
+        return item
+
+    def _make_placeholder(self, node):
+        placeholder = QTreeWidgetItem(["Loading…", ""])
+        placeholder.setData(0, Qt.ItemDataRole.UserRole, (self._LAZY_TAG, node))
+        italic = placeholder.font(0)
+        italic.setItalic(True)
+        placeholder.setFont(0, italic)
+        placeholder.setForeground(0, QColor("#8A8A8A"))
+        return placeholder
+
+    def _populate_shallow(self, parent_item, parent_node):
+        for child in parent_node.children:
+            item = self._build_item_for_node(child)
+            parent_item.addChild(item)
+            if child.is_folder and child.children:
+                item.addChild(self._make_placeholder(child))
+
+    def _populate_eager(self, parent_item, parent_node):
+        for child in parent_node.children:
+            item = self._build_item_for_node(child)
+            parent_item.addChild(item)
+            if child.is_folder:
+                self._populate_eager(item, child)
+
+    def _on_tree_item_expanded(self, item):
+        if item.childCount() != 1:
+            return
+        placeholder = item.child(0)
+        data = placeholder.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(data, tuple) and data[0] == self._LAZY_TAG:
+            node = data[1]
+            item.removeChild(placeholder)
+            self._populate_shallow(item, node)
 
     def update_preview(self):
         structure = self.input_text.toPlainText().strip()
@@ -1124,39 +1649,28 @@ class FolderSmithPro(QMainWindow):
             self.tree_diagram_detected = False
 
         root_node, indent_unit = parse_structure(structure)
+        total_nodes = count_nodes(root_node)
 
         root_item = QTreeWidgetItem(self.tree_widget)
         root_item.setText(0, "Project Structure")
-        root_item.setIcon(0, make_emoji_icon("📁"))
+        root_item.setIcon(0, get_cached_icon("📁"))
 
-        def add_children(parent_node, parent_item):
-            for child in parent_node.children:
-                item = QTreeWidgetItem(parent_item)
-                item.setText(0, child.name)
-                if child.is_folder:
-                    item.setIcon(0, make_emoji_icon("📂"))
-                    item.setForeground(0, QColor(get_folder_color(child.depth)))
-                else:
-                    item.setIcon(0, make_emoji_icon("📄"))
-                    item.setForeground(0, QColor(get_file_color(child.name)))
+        if total_nodes > LAZY_LOAD_THRESHOLD:
+            self._populate_shallow(root_item, root_node)
+            root_item.setExpanded(True)
+        else:
+            self._populate_eager(root_item, root_node)
+            self.tree_widget.expandAll()
 
-                if child.comment:
-                    item.setText(1, child.comment)
-                    item.setForeground(1, QColor(COMMENT_COLOR))
-                    comment_font = item.font(1)
-                    comment_font.setItalic(True)
-                    item.setFont(1, comment_font)
-
-                if child.is_folder:
-                    add_children(child, item)
-
-        add_children(root_node, root_item)
-        self.tree_widget.expandAll()
         self.tree_widget.resizeColumnToContents(0)
         if self.tree_widget.columnWidth(1) < 160:
             self.tree_widget.setColumnWidth(1, 220)
 
-        if self.tree_diagram_detected:
+        if total_nodes > LAZY_LOAD_THRESHOLD:
+            self.status_bar.showMessage(
+                f"Ready. {total_nodes:,} items - expand a folder in the preview to load it."
+            )
+        elif self.tree_diagram_detected:
             self.status_bar.showMessage(
                 "Tree diagram detected - structure will be automatically cleaned"
             )
@@ -1183,6 +1697,17 @@ class FolderSmithPro(QMainWindow):
                 self, "Nothing to show", "No valid folders or files were found in the input."
             )
             return
+        total_nodes = count_nodes(root_node)
+        if total_nodes > 4000:
+            proceed = QMessageBox.question(
+                self,
+                "Large Structure",
+                f"This structure has {total_nodes:,} items. Deep Dive builds one row per "
+                "item, so this may take a moment. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if proceed != QMessageBox.StandardButton.Yes:
+                return
         dlg = DeepDiveDialog(root_node, self)
         dlg.exec()
 
@@ -1255,6 +1780,89 @@ class FolderSmithPro(QMainWindow):
     def clear_input(self):
         self.input_text.clear()
         self.status_bar.showMessage("Input cleared. Ready for new structure.")
+
+    def import_folder(self):
+        """Scan a real folder on disk and turn it into a project structure
+        - the other direction from Create Structure. Scanning runs on a
+        background thread (FolderScanWorker) so importing a large folder
+        never freezes the window."""
+        if self.scan_worker is not None:
+            return  # a scan is already running
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Folder to Import", "", QFileDialog.Option.ShowDirsOnly
+        )
+        if not folder:
+            return
+
+        self.import_folder_btn.setEnabled(False)
+        self.create_btn.setEnabled(False)
+        self.simulate_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 0)  # indeterminate - item count isn't known up front
+        self.progress_bar.setVisible(True)
+        self.status_bar.showMessage(f"Scanning {folder} ...")
+
+        self.scan_worker = FolderScanWorker(folder)
+        self.scan_worker.progress.connect(
+            lambda n: self.status_bar.showMessage(f"Scanning {folder} ... {n:,} items")
+        )
+        self.scan_worker.completed.connect(self.on_scan_completed)
+        self.scan_worker.error.connect(self.on_scan_error)
+        self.scan_worker.finished.connect(self._reset_scan_ui)
+        self.scan_worker.start()
+
+    def on_scan_completed(self, payload):
+        wrapper_root, count = payload
+        text = render_structure_text(wrapper_root, self.tree_style)
+        self.input_text.setPlainText(text)
+
+        top = wrapper_root.children[0] if wrapper_root.children else None
+        if top is not None:
+            root_path = os.path.dirname(self.scan_worker.folder_path) if self.scan_worker else ""
+            if root_path:
+                if self.folder_combo.findText(root_path) == -1:
+                    self.folder_combo.insertItem(0, root_path)
+                self.folder_combo.setCurrentText(root_path)
+
+        self.status_bar.showMessage(f"Imported {count:,} item(s) from folder.")
+
+    def on_scan_error(self, message):
+        QMessageBox.warning(self, "Import Folder", message)
+        self.status_bar.showMessage("Folder import failed.")
+
+    def _reset_scan_ui(self):
+        self.import_folder_btn.setEnabled(True)
+        self.create_btn.setEnabled(True)
+        self.simulate_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self.scan_worker = None
+
+    def on_tree_style_changed(self, _index):
+        """Re-renders whatever structure is currently loaded in the
+        chosen style, so the toggle applies immediately instead of only
+        affecting the next import/preset."""
+        self.tree_style = self.tree_style_combo.currentData()
+        text = self.input_text.toPlainText().strip()
+        if not text:
+            return
+        root_node, _ = parse_structure(text)
+        if not root_node.children:
+            return
+        rendered = render_structure_text(root_node, self.tree_style)
+        self.input_text.blockSignals(True)
+        self.input_text.setPlainText(rendered)
+        self.input_text.blockSignals(False)
+        self.update_preview()
+
+    def load_selected_preset(self, _index=None):
+        name = self.preset_combo.currentText()
+        if name not in PRESET_STRUCTURES:
+            return
+        root_node, _ = parse_structure(PRESET_STRUCTURES[name])
+        text = render_structure_text(root_node, self.tree_style)
+        self.input_text.setPlainText(text)
+        self.status_bar.showMessage(f"Loaded preset: {name}")
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -1338,36 +1946,7 @@ class FolderSmithPro(QMainWindow):
         self.structure_worker = None
 
     def load_sample_structure(self):
-        sample = """# FolderSmith Pro Sample Structure
-project_root/
-├── app/
-│   ├── __init__.py
-│   ├── main.py  # Main application entry point
-│   ├── core/
-│   │   ├── __init__.py
-│   │   └── logic.py  // Core functionality
-│   └── utils/
-│       ├── __init__.py
-│       ├── helpers.py  /* Utility functions */
-│       └── validators.py
-├── tests/
-│   ├── unit/
-│   │   └── test_core.py
-│   └── integration/
-│       └── test_app.py
-├── docs/
-│   ├── index.html  <!-- Documentation home -->
-│   └── style.css
-├── data/
-│   ├── input/
-│   └── output/
-├── config/
-│   └── settings.json  // Configuration settings
-├── requirements.txt  # Dependencies
-├── README.md  /* Project documentation */
-└── .gitignore
-"""
-        self.input_text.setPlainText(sample)
+        self.input_text.setPlainText(SAMPLE_STRUCTURE)
         self.status_bar.showMessage("Sample structure loaded. Edit as needed.")
 
     def open_structure(self):
@@ -1544,11 +2123,14 @@ project_root/
         <body>
             <center>
                 <h1>📁 FolderSmith Pro</h1>
-                <p><strong>Version 3.0</strong></p>
-                <p>Create project folder and file structures.</p>
+                <p><strong>Version 4.0</strong></p>
+                <p>Turn a real folder into a project structure, or a project structure into real folders.</p>
 
                 <p><strong> Features:</strong></p>
                 <ul>
+                    <li> Import Folder - scan any real folder on disk into an editable project structure</li>
+                    <li> Two tree styles (tree diagram / plain indented), toggle any time</li>
+                    <li> Ready-made presets for common project types</li>
                     <li>variety of comment extraction (#, //, /* */, &lt;!-- --&gt;, --, ;, %)</li>
                     <li> Deep Dive breakdown of every folder and file</li>
                     <li> Verification of disk after creation</li>
@@ -1580,8 +2162,25 @@ project_root/
         help_text = """
         <html>
         <center>
-        <h1>Creating Project Structures</h1>
-        <p>FolderSmith Pro makes it easy to create complex project structures.</p>
+        <h1>Working With Project Structures</h1>
+        <p>FolderSmith Pro works in both directions: turn a real folder into a
+        project structure with <b>Import Folder</b>, or type/paste a structure
+        and click <b>Create Structure</b> to build the real folders and files.</p>
+
+        <h2>Import Folder</h2>
+        <p>Click <b>Import Folder…</b> to scan any real folder on disk (any
+        project type) and turn it straight into an editable structure. Large
+        folders are scanned on a background thread and the preview loads
+        folders on demand, so importing a big folder never freezes the app.</p>
+
+        <h2>Tree Style</h2>
+        <p>Use the <b>Tree style</b> dropdown to switch how a structure is
+        written - as a connector-style tree diagram (├── └──) or as plain
+        indented text. Switching it re-renders whatever is currently loaded.</p>
+
+        <h2>Presets</h2>
+        <p>Pick a ready-made layout from the <b>Preset</b> dropdown for common
+        project types - no internet connection needed.</p>
 
         <h2>Basic Syntax</h2>
         <table border="1" cellpadding="5" style="border-collapse: collapse; margin: 20px auto;">
@@ -1634,6 +2233,10 @@ project/
         if self.zip_worker and self.zip_worker.isRunning():
             self.zip_worker.cancel()
             self.zip_worker.wait(1000)
+
+        if self.scan_worker and self.scan_worker.isRunning():
+            self.scan_worker.cancel()
+            self.scan_worker.wait(1000)
 
         event.accept()
 
