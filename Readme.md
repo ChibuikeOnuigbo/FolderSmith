@@ -71,7 +71,6 @@ Paste that block (or your own) into FolderSmith Pro and it will build the matchi
 
 ![FolderSmith Pro output example](output.png)
 
-*(Drop your `output.png` or `output.jpg` screenshot into this folder — either extension works with the image link above.)*
 
 ##  Support & Contact
 
