@@ -1,21 +1,31 @@
-# 📁 FolderSmith Pro
+# FolderSmith Pro
 
-Create entire project folder and file structures from a single pasted block of text — no clicking through dozens of "New Folder" dialogs. Paste a plain-indented list or an ASCII tree diagram, preview it live, and generate the real thing on disk (or export it straight to a ZIP).
+Make a full app layout in one go. No need to click New Folder many times. Just type or paste a list, or a tree chart, and see it live. Then build it on disk, or save it as a ZIP.
 
-![FolderSmith Pro screenshot](app.png)
+![FolderSmith Pro image](app.png)
 
-##  Features
+## What It Does
 
--  **Paste-to-structure** — turn a plain-text outline into real folders and files in one click
--  **Smart tree-diagram parsing** — paste ASCII tree diagrams (`├──`, `│`, `└──`) directly, symbols are handled automatically
--  **Multi-language comment extraction** — strips trailing comments in `#`, `//`, `/* */`, `<!-- -->`, `--`, `;`, and `%` styles so they don't end up in file/folder names
--  **Live preview** that always matches exactly what gets created
--  **Deep Dive view** — a searchable, flattened table of every folder and file before you commit
-- ✔ **On-disk verification** after creation, so you know nothing silently failed
--  **Export to ZIP** instead of writing to disk
--  Color-coded syntax highlighting by file type
+- Paste text. Get folder and file items in one click.
+- Reads tree charts too (the marks: `├──` `│` `└──`). No extra work from you.
+- Pulls end notes from lines (`#` `//` `/* */` `<!-- -->` `--` `;` `%`) so they do not end up in names.
+- Live view that shows just what you will get.
+- Deep Dive view: a full list you can search, of every folder and file, before you build.
+- Checks on disk after it is done, so you know it all went well.
+- Save as ZIP, if you do not want to write to disk.
+- Color marks by file kind.
 
-##  Requirements
+## New Stuff
+
+- **Style auto-pick.** Tree, plain text, or mixed - it picks the right one as you type. Tick "Enforce this style" to lock it. It will not swap style on its own then.
+- **Mixed text read.** Tree marks plus plain space, read the best it can. Lines with no marks and no space stay flat, since there is no way to know depth for sure.
+- **Live view acts like a file view.** Drag an item to move it. Right click to add a new folder or file, to rename, to swap folder and file, or to del it.
+  - When you swap a folder into a file, it asks for a suffix (like `txt` or `py`). Close the box to skip it.
+  - When you swap a file into a folder, it asks if you want to drop the old suffix.
+- **No-limit undo and redo.** It works for typed text and for view edits, both, as one.
+- **Multi cursor text box**, much like in VS Code. See Keys below.
+
+## Needs
 
 - Python 3.9+
 - [PyQt6](https://pypi.org/project/PyQt6/)
@@ -24,29 +34,29 @@ Create entire project folder and file structures from a single pasted block of t
 pip install PyQt6
 ```
 
-##  Usage
+## Usage
 
 ```bash
 python foldersmith.py
 ```
 
-1. Paste your project structure into the input box (see format below).
-2. Check the live preview on the right — it shows exactly what will be created.
-3. Optionally open **Tools → Deep Dive** for a full breakdown table.
-4. Click **Create Structure** to generate it on disk, or export it as a ZIP.
+1. Paste your layout into the box (see form below).
+2. Check the live view on the right. It shows just what will be made.
+3. If you wish, open Tools, then Deep Dive, for a full list first.
+4. Click Create Structure to build it, or use Export as ZIP.
 
-##  Structure Format
+## Layout Format
 
-| Element | Syntax | Example |
+| Part | Syntax | Sample |
 |---|---|---|
 | Folder | Ends with `/` | `src/` |
-| File | No trailing slash | `main.py` |
-| Nesting | Indent with spaces | `  utils/` |
-| Comments | `#` `//` `/* */` `<!-- -->` `--` `;` `%` | `main.py  # entry point` |
+| File | No end slash | `main.py` |
+| Depth | Indent with spaces | `  utils/` |
+| Notes | `#` `//` `/* */` `<!-- -->` `--` `;` `%` | `main.py  # entry point` |
 
-Tree diagrams pasted from `tree` output or similar tools are also supported and parsed automatically.
+Tree charts, pasted from `tree` or like tools, also work. They get read and fixed at once.
 
-### Sample project structure
+### Sample layout
 
 ```
 my-app/
@@ -65,18 +75,36 @@ my-app/
 └── README.md
 ```
 
-Paste that block (or your own) into FolderSmith Pro and it will build the matching folders and files for you.
+Paste that block (or your own) into FolderSmith Pro and it will build the folder and file items for you.
 
-## 📸 Output
+## Keys
 
-![FolderSmith Pro output example](output.png)
+| Keys | What It Does |
+|---|---|
+| Ctrl+Z | Undo - text or view edits, both |
+| Ctrl+Y | Redo |
+| Alt+Click | Add an extra cursor. Click it again to del it |
+| Alt+Shift+Click | Add a line of cursor spots, from here to the click spot |
+| Esc | Clear all extra cursor spots |
+| Alt+Up | Move this line up one spot |
+| Alt+Down | Move this line down one spot |
+| Alt+Shift+Up | Copy this line, put the copy up |
+| Alt+Shift+Down | Copy this line, put the copy down |
+| Home | Press once: go to first mark on line. Press again: go to spot zero |
+| Ctrl+I | Import Folder (bring in a real folder) |
+| Ctrl+Shift+C | Clear all text |
 
+Note: cursor spots do not make a block pick, just many type spots.
 
-##  Support & Contact
+## Output
+
+![FolderSmith Pro sample](output.png)
+
+## Help
 
 - Email: [studiocoding09@gmail.com](mailto:studiocoding09@gmail.com)
-- Support: (https://chibuikeonuigbo.github.io/Support_Page/)
+- More help: (https://chibuikeonuigbo.github.io/Support_Page/)
 
-##  License
+## Rights
 
-© 2025 FolderSmith Pro. All rights reserved.
+(c) 2025 FolderSmith Pro. All rights kept.
