@@ -31,7 +31,11 @@ from PyQt6.QtGui import (
     QGuiApplication,
     QCursor,
     QPixmap,
-    QPainter,QGuiApplication
+    QPainter,QGuiApplication,
+    QKeySequence,
+    QShortcut,
+    QTextCursor,
+    QPen,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -60,7 +64,10 @@ from PyQt6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHeaderView,
     QTableWidget,
-    QTableWidgetItem
+    QTableWidgetItem,
+    QAbstractItemView,
+    QInputDialog,
+    QToolButton,
 )
 
 
@@ -199,6 +206,24 @@ def get_cached_icon(emoji, size=28):
     return icon
 
 
+_ACTION_ICON_CACHE = {}
+
+
+def get_icon_for_action(name, fallback_emoji):
+    """Load an icon from the assets/ folder (undo.svg, redo.svg, ...) next
+    to this script - falling back to a rendered emoji glyph if the file
+    isn't there, so a missing asset folder never breaks a button, it just
+    looks a little plainer."""
+    if name in _ACTION_ICON_CACHE:
+        return _ACTION_ICON_CACHE[name]
+    path = get_asset_path(f"{name}.svg")
+    icon = QIcon(path) if os.path.isfile(path) else None
+    if icon is None or icon.isNull():
+        icon = make_emoji_icon(fallback_emoji, size=28)
+    _ACTION_ICON_CACHE[name] = icon
+    return icon
+
+
 #come back here later
 # Structure parsing - the ONE place that turns pasted text into a tree.
 #
@@ -245,16 +270,54 @@ def strip_comment(line):
     return line[: best.start()].rstrip(), best.group(0).strip()
 
 
-def parse_structure(text):
-    """Parse pasted folder-structure text (plain-indented or ASCII tree
-    diagram) into a tree of Node objects, rooted at a synthetic empty root.
+def parse_structure(text, ignore_connectors=False, smart_mixed=False):
+    """Parse pasted folder-structure text (plain-indented, ASCII tree
+    diagram, or a mix of both) into a tree of Node objects, rooted at a
+    synthetic empty root.
 
     Depth is computed primarily from tree-diagram connector characters
     (│ ├ └), since those survive most copy/paste pipelines better than
     literal spaces do; plain-indented input falls back to leading spaces,
     using the smallest observed indent as one level.
+
+    Two things make this "mix-tolerant":
+
+    - A "bare" connector - a "├──"/"└──" with no "│" pipes leading it - is
+      common when a diagram gets partially flattened (e.g. someone typed
+      "└── processed/" straight under "raw/" with no indentation at all).
+      Its literal symbol count is misleading there, so instead of trusting
+      it as an absolute depth, it's resolved *relative to whatever folder
+      is currently open* - "└──" attaches as a sibling of the innermost
+      open item (closing that item's spot), "├──" nests one level inside
+      it. A connector with real "│" pipes in front of it IS trusted
+      literally, since that's a reliable, deliberate signal.
+    - Fully bare lines (no connector, no leading spaces at all) carry no
+      nesting signal whatsoever - guessing "deeper" or "sibling" for those
+      is a coin flip that's provably wrong as often as it's right (e.g. a
+      flat list where item B should nest under item A, but item C right
+      after should NOT nest under B). So those are left at whatever the
+      leading-space math says (top-level, if there's truly no indent) -
+      an honest "I don't have enough information" rather than a
+      confident-looking guess. Add indentation or a connector to any line
+      that needs to nest and it will always be resolved correctly.
+
+    The bare-connector heuristic above only activates when `smart_mixed`
+    is True (the text was auto-detected, or manually marked, as Mixed).
+    A properly formed tree diagram legitimately has bare "├── "/"└── "
+    connectors on every depth-1 item (nothing needs a pipe in front of it
+    until depth 2), so blindly re-interpreting every bare connector would
+    break perfectly good tree diagrams - it's only useful once other
+    lines in the same text prove the pipes aren't being used consistently.
+
+    If `ignore_connectors` is True (used when the user has manually
+    enforced "Plain indented" style), │├└─ characters are stripped and
+    treated as ordinary noise instead of structural signals, so pasted
+    tree-diagram glyphs can never be misread as nesting information.
     """
     lines = text.split("\n")
+
+    if ignore_connectors:
+        lines = [re.sub(r"[│├└─]", " ", l) for l in lines]
 
     plain_indents = []
     for l in lines:
@@ -275,12 +338,20 @@ def parse_structure(text):
         prefix_match = re.match(r"^([│├└─\s]*)", raw)
         prefix = prefix_match.group(1)
         sym_count = sum(prefix.count(c) for c in "│├└")
+        has_pipe = "│" in prefix
         connector = None
         for ch in prefix:
             if ch in "├└":
                 connector = ch
 
-        if sym_count > 0:
+        top = stack[-1]
+
+        if smart_mixed and sym_count > 0 and connector and not has_pipe:
+            # Bare connector, no pipe context: resolve relative to the
+            # currently open folder rather than trusting the raw count.
+            base = top.depth if top is not root else 0
+            depth = base if connector == "└" else base + 1
+        elif sym_count > 0:
             depth = sym_count
         else:
             lead = len(raw) - len(raw.lstrip(" "))
@@ -297,7 +368,6 @@ def parse_structure(text):
         if not name:
             continue
 
-        top = stack[-1]
         # A folder declared with a closing "└" connector cannot have a
         # sibling at the same tree-diagram depth ("└" means "last item at
         # this level"). If the input's whitespace got collapsed (common
@@ -326,6 +396,37 @@ def parse_structure(text):
             stack.append(node)
 
     return root, indent_unit
+
+
+def detect_structure_style(text):
+    """Best-effort classification of how a chunk of typed/pasted text is
+    formatted: STYLE_TREE_DIAGRAM, STYLE_PLAIN_INDENT, STYLE_MIXED, or
+    None if there isn't enough text to tell (fewer than 2 content lines -
+    nothing to auto-switch the dropdown over).
+
+    The rule only looks at lines *after* the first, since a hand-written
+    tree diagram's very first line is conventionally the bare root name
+    with no connector glyph at all - that's not a mixed signal, it's just
+    how tree diagrams are written.
+    """
+    content_lines = [l for l in text.split("\n") if l.strip()]
+    if len(content_lines) < 2:
+        return None
+
+    box_count = indent_count = flat_count = 0
+    for l in content_lines[1:]:
+        if any(c in l for c in "│├└"):
+            box_count += 1
+        elif len(l) - len(l.lstrip(" ")) > 0:
+            indent_count += 1
+        else:
+            flat_count += 1
+
+    if box_count == 0:
+        return STYLE_PLAIN_INDENT
+    if indent_count == 0 and flat_count == 0:
+        return STYLE_TREE_DIAGRAM
+    return STYLE_MIXED
 
 
 def compute_stats(root):
@@ -502,9 +603,18 @@ class FolderScanWorker(QThread):
 # ---------------------------------------------------------------------------
 STYLE_TREE_DIAGRAM = "tree"
 STYLE_PLAIN_INDENT = "indent"
+# Not a real output format - text can't be "rendered as mixed". It only
+# ever appears as an auto-detected label telling the user their input
+# combines both conventions; picking Tree diagram or Plain indented from
+# the dropdown cleans it up into one consistent style.
+STYLE_MIXED = "mixed"
 
 
 def render_structure_text(root_node, style, indent_unit=2):
+    # STYLE_MIXED has no output format of its own - it only ever labels
+    # detected input. Rendering it falls back to the tree diagram, which
+    # is also the cleanup path when the user manually picks "Mixed" to
+    # normalize ambiguous text.
     if style == STYLE_PLAIN_INDENT:
         return _render_plain_indent(root_node, indent_unit)
     return _render_tree_diagram(root_node)
@@ -753,12 +863,15 @@ class StructureWorker(QThread):
     completed = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, structure, root_path, delete_existing, extract_comments):
+    def __init__(self, structure, root_path, delete_existing, extract_comments,
+                 ignore_connectors=False, smart_mixed=False):
         super().__init__()
         self.structure = structure
         self.root_path = root_path
         self.delete_existing = delete_existing
         self.extract_comments = extract_comments
+        self.ignore_connectors = ignore_connectors
+        self.smart_mixed = smart_mixed
         self.canceled = False
 
     def run(self):
@@ -783,7 +896,11 @@ class StructureWorker(QThread):
             if not root_existed:
                 result["folders_created"] += 1
 
-            root_node, _ = parse_structure(self.structure)
+            root_node, _ = parse_structure(
+                self.structure,
+                ignore_connectors=self.ignore_connectors,
+                smart_mixed=self.smart_mixed,
+            )
             total_nodes = max(count_nodes(root_node), 1)
             processed = 0
 
@@ -1053,6 +1170,404 @@ class DeepDiveDialog(QDialog):
         layout.addLayout(btn_row)
 
 
+# The structure text box, with one small addition: a signal that fires
+# right after a paste completes (Ctrl+V, middle-click, or drag-drop text),
+# so "Enforce this style" can auto-correct pasted content immediately
+# instead of only on the next debounced pause in typing.
+class StructureTextEdit(QTextEdit):
+    """The structure text box, with VS Code-style multi-cursor editing.
+
+    - Alt+click: add a secondary cursor at the click point.
+    - Alt+click on an existing secondary cursor: remove it.
+    - Alt+Shift+click: add a column of cursors, one per line, from the
+      current cursor's line down (or up) to the clicked line, all at the
+      clicked column (clamped to each line's length).
+    - Escape: clear every secondary cursor.
+    - Alt+Up / Alt+Down: move the current line up/down.
+    - Alt+Shift+Up / Alt+Shift+Down: duplicate the current line up/down
+      (VS Code's "Copy Line Up/Down").
+    - Home: first press goes to the first non-whitespace character on the
+      line, a second press (already there) goes to true column 0 - VS
+      Code's "smart Home".
+
+    Typing, Backspace, Delete, Enter and Tab are applied to *every* cursor
+    at once when secondary cursors exist - not just drawn as decoration.
+    Edits are applied right-to-left across cursor positions so earlier
+    edits never invalidate the positions of cursors still waiting their
+    turn, which is what makes doing this safely on a plain QTextEdit
+    possible without a custom text-layout engine.
+
+    Line move/duplicate act on the primary cursor only and clear any
+    secondary cursors first - swapping or duplicating several
+    independently-positioned lines safely at once is a lot more
+    bookkeeping for a use case that's rare in practice (people move/
+    duplicate one line at a time even when they're mid multi-cursor edit).
+    Full VS Code-style column/word "hypotenuse" range highlighting isn't
+    implemented either - this gives you a working column of caret
+    positions to type into, not highlighted column *selections*.
+    """
+
+    pasted = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._extra_cursors = []  # list[QTextCursor], secondary carets only
+        self._caret_visible = True
+        self._blink_timer = QTimer(self)
+        self._blink_timer.timeout.connect(self._toggle_blink)
+        self._blink_timer.start(500)
+        self._home_toggle_col = None
+
+    # -- painting the secondary carets ------------------------------------
+
+    def _toggle_blink(self):
+        if not self._extra_cursors:
+            return
+        self._caret_visible = not self._caret_visible
+        self.viewport().update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._extra_cursors or not self._caret_visible:
+            return
+        painter = QPainter(self.viewport())
+        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Text), 2))
+        for cur in self._extra_cursors:
+            rect = self.cursorRect(cur)
+            painter.drawLine(rect.topLeft(), rect.bottomLeft())
+        painter.end()
+
+    # -- helpers ------------------------------------------------------------
+
+    def _cursor_at(self, pos):
+        c = QTextCursor(self.document())
+        c.setPosition(max(0, min(pos, self.document().characterCount() - 1)))
+        return c
+
+    def _normalize_extra_cursors(self):
+        """Drop any secondary cursor that's collided with the primary
+        cursor or with another secondary cursor after a move/edit."""
+        primary_pos = self.textCursor().position()
+        seen = {primary_pos}
+        deduped = []
+        for c in self._extra_cursors:
+            p = c.position()
+            if p not in seen:
+                seen.add(p)
+                deduped.append(c)
+        self._extra_cursors = deduped
+
+    def clear_extra_cursors(self):
+        if self._extra_cursors:
+            self._extra_cursors = []
+            self.viewport().update()
+
+    def setPlainText(self, text):
+        # Any wholesale text replacement (undo/redo, style reformat, a
+        # tree edit, Import Folder, ...) invalidates whatever the extra
+        # cursors were pointing at - always start clean.
+        self._extra_cursors = []
+        super().setPlainText(text)
+
+    # -- adding cursors with the mouse --------------------------------------
+
+    def _add_or_remove_cursor(self, point):
+        pos = self.cursorForPosition(point).position()
+        if pos == self.textCursor().position():
+            return  # can't stack a clone directly on the real cursor
+        for i, c in enumerate(self._extra_cursors):
+            if c.position() == pos:
+                del self._extra_cursors[i]  # click again to remove it
+                self.viewport().update()
+                return
+        self._extra_cursors.append(self._cursor_at(pos))
+        self.viewport().update()
+
+    def _add_column_cursors(self, point):
+        click_cursor = self.cursorForPosition(point)
+        anchor_line = self.textCursor().blockNumber()
+        click_line = click_cursor.blockNumber()
+        start_line, end_line = sorted((anchor_line, click_line))
+        col = click_cursor.positionInBlock()
+
+        doc = self.document()
+        positions = []
+        for line in range(start_line, end_line + 1):
+            block = doc.findBlockByNumber(line)
+            if not block.isValid():
+                continue
+            line_col = min(col, len(block.text()))
+            positions.append(block.position() + line_col)
+        if not positions:
+            return
+
+        self.setTextCursor(self._cursor_at(positions[0]))
+        self._extra_cursors = [self._cursor_at(p) for p in positions[1:]]
+        self._normalize_extra_cursors()
+        self.viewport().update()
+
+    def mousePressEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+            point = event.position().toPoint()
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._add_column_cursors(point)
+            else:
+                self._add_or_remove_cursor(point)
+            event.accept()
+            return
+        self.clear_extra_cursors()
+        super().mousePressEvent(event)
+
+    def insertFromMimeData(self, source):
+        self._extra_cursors = []
+        super().insertFromMimeData(source)
+        self.pasted.emit()
+
+    # -- applying one edit to every cursor at once --------------------------
+
+    def _apply_to_all_cursors(self, edit_fn):
+        """Apply edit_fn to the primary cursor and every secondary cursor
+        at once.
+
+        The bug this replaces: it used to snapshot each cursor's
+        position as a plain integer, edit a *fresh* cursor built from
+        that integer, and record wherever that fresh cursor ended up -
+        then reuse those recorded integers to rebuild the cursor list
+        for next time. That recording goes stale the instant *another*
+        cursor, positioned earlier in the document, inserts or deletes
+        text afterward - everything after it shifts, but the already
+        recorded integer doesn't know that. It drifted a little more
+        with every single keystroke, which is exactly why five lines of
+        "happy" came out fine on the first letter and garbage everywhere
+        after.
+
+        The actual fix is to not track plain integers at all: every
+        cursor here (self.textCursor() and everything in
+        self._extra_cursors) is a genuine *live* QTextCursor tied to
+        this document, and Qt automatically keeps every other live
+        cursor correctly repositioned whenever any one of them edits the
+        document - insert, delete, whatever. So editing the real cursor
+        objects directly, in any order, is already correct with no
+        offset math needed.
+        """
+        primary = self.textCursor()
+        cursors = [primary] + self._extra_cursors
+
+        primary.beginEditBlock()
+        for cur in cursors:
+            edit_fn(cur)
+        primary.endEditBlock()
+
+        self.setTextCursor(primary)
+        self._extra_cursors = cursors[1:]
+        self._normalize_extra_cursors()
+        self.viewport().update()
+
+    def _move_all_cursors(self, op):
+        primary = self.textCursor()
+        cursors = [primary] + self._extra_cursors
+        for cur in cursors:
+            cur.movePosition(op, QTextCursor.MoveMode.MoveAnchor)
+        self.setTextCursor(primary)
+        self._extra_cursors = cursors[1:]
+        self._normalize_extra_cursors()
+        self.viewport().update()
+
+    _NAV_OPS = {
+        Qt.Key.Key_Left: QTextCursor.MoveOperation.Left,
+        Qt.Key.Key_Right: QTextCursor.MoveOperation.Right,
+        Qt.Key.Key_Up: QTextCursor.MoveOperation.Up,
+        Qt.Key.Key_Down: QTextCursor.MoveOperation.Down,
+        Qt.Key.Key_Home: QTextCursor.MoveOperation.StartOfLine,
+        Qt.Key.Key_End: QTextCursor.MoveOperation.EndOfLine,
+    }
+
+    def _handle_multicursor_key(self, event):
+        """Returns True if this key was handled across all cursors."""
+        text = event.text()
+        key = event.key()
+        mods = event.modifiers()
+
+        if text and text.isprintable() and not (mods & Qt.KeyboardModifier.ControlModifier):
+            self._apply_to_all_cursors(lambda c, t=text: c.insertText(t))
+            return True
+        if key == Qt.Key.Key_Backspace:
+            self._apply_to_all_cursors(lambda c: c.deletePreviousChar())
+            return True
+        if key == Qt.Key.Key_Delete:
+            self._apply_to_all_cursors(lambda c: c.deleteChar())
+            return True
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._apply_to_all_cursors(lambda c: c.insertText("\n"))
+            return True
+        if key == Qt.Key.Key_Tab:
+            self._apply_to_all_cursors(lambda c: c.insertText("\t"))
+            return True
+        if key in self._NAV_OPS:
+            self._move_all_cursors(self._NAV_OPS[key])
+            return True
+        # Anything else (Ctrl+C, Ctrl+V, Ctrl+A, function keys, ...) isn't
+        # multi-cursor-aware here - drop back to single-cursor behavior
+        # rather than leave the secondary cursors in an undefined state.
+        self.clear_extra_cursors()
+        return False
+
+    # -- line move / duplicate ----------------------------------------------
+
+    def _move_line(self, direction):
+        cursor = self.textCursor()
+        doc = self.document()
+        block = cursor.block()
+        target_number = block.blockNumber() + direction
+        if target_number < 0 or target_number >= doc.blockCount():
+            return
+        col = cursor.positionInBlock()
+        this_text = block.text()
+        other_block = doc.findBlockByNumber(target_number)
+        other_text = other_block.text()
+        top_block, bottom_block = (other_block, block) if direction < 0 else (block, other_block)
+
+        span = QTextCursor(doc)
+        span.setPosition(top_block.position())
+        span.setPosition(
+            bottom_block.position() + len(bottom_block.text()), QTextCursor.MoveMode.KeepAnchor
+        )
+        replacement = (
+            f"{this_text}\n{other_text}" if direction < 0 else f"{other_text}\n{this_text}"
+        )
+        span.beginEditBlock()
+        span.insertText(replacement)
+        span.endEditBlock()
+
+        new_block = doc.findBlockByNumber(target_number)
+        new_col = min(col, len(new_block.text()))
+        self.setTextCursor(self._cursor_at(new_block.position() + new_col))
+        self.clear_extra_cursors()
+        self.ensureCursorVisible()
+
+    def _duplicate_line(self, direction):
+        cursor = self.textCursor()
+        doc = self.document()
+        block = cursor.block()
+        text = block.text()
+        col = cursor.positionInBlock()
+
+        insert_cursor = QTextCursor(doc)
+        insert_cursor.beginEditBlock()
+        if direction < 0:
+            insert_cursor.setPosition(block.position())
+            insert_cursor.insertText(text + "\n")
+            new_pos = block.position() + col
+        else:
+            insert_cursor.setPosition(block.position() + len(text))
+            insert_cursor.insertText("\n" + text)
+            new_pos = block.position() + len(text) + 1 + col
+        insert_cursor.endEditBlock()
+
+        self.setTextCursor(self._cursor_at(new_pos))
+        self.clear_extra_cursors()
+        self.ensureCursorVisible()
+
+    # -- key dispatch ---------------------------------------------------------
+
+    def keyPressEvent(self, event):
+        mods = event.modifiers()
+        key = event.key()
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+
+        if alt and shift and key == Qt.Key.Key_Up:
+            self._duplicate_line(-1)
+            event.accept()
+            return
+        if alt and shift and key == Qt.Key.Key_Down:
+            self._duplicate_line(1)
+            event.accept()
+            return
+        if alt and not shift and key == Qt.Key.Key_Up:
+            self._move_line(-1)
+            event.accept()
+            return
+        if alt and not shift and key == Qt.Key.Key_Down:
+            self._move_line(1)
+            event.accept()
+            return
+        if key == Qt.Key.Key_Escape and self._extra_cursors:
+            self.clear_extra_cursors()
+            event.accept()
+            return
+
+        # Smart Home (single-cursor only): first press -> first
+        # non-whitespace character, second press from there -> column 0.
+        if key == Qt.Key.Key_Home and not shift and not self._extra_cursors:
+            cursor = self.textCursor()
+            block_text = cursor.block().text()
+            first_non_ws = len(block_text) - len(block_text.lstrip())
+            if cursor.positionInBlock() == first_non_ws:
+                target = 0
+            else:
+                target = first_non_ws
+            cursor.setPosition(cursor.block().position() + target)
+            self.setTextCursor(cursor)
+            event.accept()
+            return
+
+        if self._extra_cursors and self._handle_multicursor_key(event):
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
+
+# The live preview tree, made interactive.
+#
+# QTreeWidget's built-in "InternalMove" drag mode already does the visual
+# work of letting an item be dragged onto a new parent - but it doesn't
+# tell anyone when a drop finished, and Delete/Backspace do nothing by
+# default. This subclass adds both: it emits `about_to_change` right
+# before Qt performs a drop (so the caller can snapshot the "before"
+# state for undo) and `changed_by_user` right after (so the caller can
+# turn the new arrangement back into text), and it turns Delete/Backspace
+# into the same `delete_requested` signal the right-click menu uses.
+#
+# Text stays authoritative: every one of these actions ends with the tree
+# being re-rendered to text and then rebuilt fresh from that text, so the
+# widget can never silently drift out of sync with what Create Structure
+# would actually produce.
+class InteractiveTreeWidget(QTreeWidget):
+    about_to_change = pyqtSignal()
+    changed_by_user = pyqtSignal()
+    delete_requested = pyqtSignal()
+    context_menu_requested = pyqtSignal(object)  # QPoint
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        # PyQt6 won't let one signal connect straight to another when their
+        # argument signatures don't match exactly (QPoint vs a generic
+        # object), so re-emit through a small wrapper instead.
+        self.customContextMenuRequested.connect(
+            lambda pos: self.context_menu_requested.emit(pos)
+        )
+
+    def dropEvent(self, event):
+        self.about_to_change.emit()
+        super().dropEvent(event)
+        self.changed_by_user.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.selectedItems():
+            self.delete_requested.emit()
+            return
+        super().keyPressEvent(event)
+
+
 # Main application window
 class FolderSmithPro(QMainWindow):
     def __init__(self):
@@ -1062,6 +1577,22 @@ class FolderSmithPro(QMainWindow):
 
         self.tree_diagram_detected = False
         self.tree_style = STYLE_TREE_DIAGRAM
+        self._preview_root_item = None
+
+        # Unified undo/redo: every entry is a full snapshot of the text
+        # box's content from just before a change. Covers both typed edits
+        # (coalesced into one step per pause, like any normal editor) and
+        # interactive preview edits (drag-move, create, rename, delete -
+        # each its own discrete step). No cap on how many steps are kept.
+        self._undo_stack = []
+        self._redo_stack = []
+        self._last_committed_text = ""
+        self._pending_typing_baseline = None
+        self._suspend_undo_capture = False
+        self._typing_debounce = QTimer(self)
+        self._typing_debounce.setSingleShot(True)
+        self._typing_debounce.setInterval(700)
+        self._typing_debounce.timeout.connect(self._commit_typing_undo_step)
 
         self.structure_worker = None
         self.zip_worker = None
@@ -1185,13 +1716,26 @@ class FolderSmithPro(QMainWindow):
         self.tree_style_combo = PopupComboBox()
         self.tree_style_combo.addItem("Tree diagram (├── └──)", STYLE_TREE_DIAGRAM)
         self.tree_style_combo.addItem("Plain indented", STYLE_PLAIN_INDENT)
+        self.tree_style_combo.addItem("Mixed (auto-detected)", STYLE_MIXED)
         self.tree_style_combo.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.tree_style_combo.currentIndexChanged.connect(self.on_tree_style_changed)
         source_row.addWidget(self.tree_style_combo)
 
+        self.enforce_style_cb = QCheckBox("Enforce this style")
+        self.enforce_style_cb.setToolTip(
+            "Lock the Tree style dropdown to whatever you pick here instead of "
+            "letting it auto-switch based on what you type. Turn this on if you "
+            "want to type plain indentation while your text happens to still "
+            "contain tree characters (├ └ │), so they're never mistaken for "
+            "structure and mixed-style detection never kicks in."
+        )
+        self.enforce_style_cb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.enforce_style_cb.stateChanged.connect(self._on_enforce_toggled)
+        source_row.addWidget(self.enforce_style_cb)
+
         left_layout.addLayout(source_row)
 
-        self.input_text = QTextEdit()
+        self.input_text = StructureTextEdit()
         self.input_text.setPlaceholderText(
             "📁 Enter your project structure (folders must end with '/')\n"
             "Or click 'Import Folder…' above to generate this from a real folder.\n"
@@ -1222,8 +1766,15 @@ class FolderSmithPro(QMainWindow):
         )
 
         self.input_text.setAcceptRichText(False)
+        # Undo/redo is handled by our own unified stack (see
+        # _on_input_text_changed / _do_undo / _do_redo) so typed edits and
+        # interactive preview edits - drag, create, delete - share a single
+        # Ctrl+Z/Ctrl+Y history instead of two that fight each other.
+        self.input_text.setUndoRedoEnabled(False)
         self.input_text.setFont(QFont("Consolas", 11))
         self.highlighter = StructureHighlighter(self.input_text.document())
+        self.input_text.installEventFilter(self)
+        self.input_text.pasted.connect(self._on_text_pasted)
         left_layout.addWidget(self.input_text, 1)
 
         # Controls panel
@@ -1330,21 +1881,64 @@ class FolderSmithPro(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
+        preview_header = QHBoxLayout()
         preview_label = QLabel("Structure Preview:")
         preview_label.setStyleSheet("font-weight: bold; font-size: 14px;")
-        right_layout.addWidget(preview_label)
+        preview_header.addWidget(preview_label)
+        preview_hint = QLabel("Drag to move · right-click to add/rename/convert/delete · Del key removes")
+        preview_hint.setStyleSheet("color: #8A8A8A; font-size: 11px;")
+        preview_header.addWidget(preview_hint)
+        preview_header.addStretch()
+
+        self.undo_btn = QToolButton()
+        self.undo_btn.setIcon(get_icon_for_action("undo", "↩"))
+        self.undo_btn.setIconSize(QSize(28, 28))
+        self.undo_btn.setFixedSize(40, 40)
+        self.undo_btn.setToolTip("Undo (Ctrl+Z)")
+        self.undo_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.undo_btn.setAutoRaise(True)
+        self.undo_btn.clicked.connect(self._do_undo)
+        preview_header.addWidget(self.undo_btn)
+
+        self.redo_btn = QToolButton()
+        self.redo_btn.setIcon(get_icon_for_action("redo", "↪"))
+        self.redo_btn.setIconSize(QSize(28, 28))
+        self.redo_btn.setFixedSize(40, 40)
+        self.redo_btn.setToolTip("Redo (Ctrl+Y)")
+        self.redo_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.redo_btn.setAutoRaise(True)
+        self.redo_btn.clicked.connect(self._do_redo)
+        preview_header.addWidget(self.redo_btn)
+
+        right_layout.addLayout(preview_header)
 
         # Two columns: item name (with icon + type color) and its comment
         # (always the same distinct green) - so a comment can never visually
         # blend into a file name, and long comments get their own space
         # instead of being clipped inline.
-        self.tree_widget = QTreeWidget()
+        self.tree_widget = InteractiveTreeWidget()
         self.tree_widget.setColumnCount(2)
         self.tree_widget.setHeaderLabels(["Structure", "Comment"])
         self.tree_widget.setWordWrap(True)
         self.tree_widget.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.tree_widget.setUniformRowHeights(True)
         self.tree_widget.itemExpanded.connect(self._on_tree_item_expanded)
+        self.tree_widget.about_to_change.connect(self._snapshot_before_tree_edit)
+        self.tree_widget.changed_by_user.connect(self._on_tree_edited)
+        self.tree_widget.delete_requested.connect(self._delete_selected_tree_items)
+        self.tree_widget.context_menu_requested.connect(self._show_tree_context_menu)
+
+        # Ctrl+Z/Ctrl+Y work here too, scoped to this widget so they can't
+        # double-fire alongside the text box's own event-filter-based undo.
+        self.tree_undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self.tree_widget)
+        self.tree_undo_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.tree_undo_shortcut.activated.connect(self._do_undo)
+        self.tree_redo_shortcut = QShortcut(QKeySequence.StandardKey.Redo, self.tree_widget)
+        self.tree_redo_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.tree_redo_shortcut.activated.connect(self._do_redo)
+        self.tree_redo_shortcut_alt = QShortcut(QKeySequence("Ctrl+Y"), self.tree_widget)
+        self.tree_redo_shortcut_alt.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.tree_redo_shortcut_alt.activated.connect(self._do_redo)
         right_layout.addWidget(self.tree_widget, 1)
 
         preview_controls = QHBoxLayout()
@@ -1393,7 +1987,7 @@ class FolderSmithPro(QMainWindow):
         """
         )
 
-        self.input_text.textChanged.connect(self.update_preview)
+        self.input_text.textChanged.connect(self._on_input_text_changed)
 
         self.status_bar.showMessage(
             "Ready. Enter your project structure and click 'Create Structure'"
@@ -1466,6 +2060,10 @@ class FolderSmithPro(QMainWindow):
         soft_action = QAction("&Create Project Structure", self)
         soft_action.triggered.connect(self.show_help)
         help_menu.addAction(soft_action)
+
+        shortcuts_action = QAction("&Shortcuts", self)
+        shortcuts_action.triggered.connect(self.show_shortcuts)
+        help_menu.addAction(shortcuts_action)
 
     def apply_theme(self):
         palette = QPalette()
@@ -1587,12 +2185,17 @@ class FolderSmithPro(QMainWindow):
     def _build_item_for_node(self, node):
         item = QTreeWidgetItem()
         item.setText(0, node.name)
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, bool(node.is_folder))
+        flags = item.flags() | Qt.ItemFlag.ItemIsDragEnabled
         if node.is_folder:
+            flags |= Qt.ItemFlag.ItemIsDropEnabled
             item.setIcon(0, get_cached_icon("📂"))
             item.setForeground(0, QColor(get_folder_color(node.depth)))
         else:
+            flags &= ~Qt.ItemFlag.ItemIsDropEnabled
             item.setIcon(0, get_cached_icon("📄"))
             item.setForeground(0, QColor(get_file_color(node.name)))
+        item.setFlags(flags)
 
         if node.comment:
             item.setText(1, node.comment)
@@ -1605,6 +2208,12 @@ class FolderSmithPro(QMainWindow):
     def _make_placeholder(self, node):
         placeholder = QTreeWidgetItem(["Loading…", ""])
         placeholder.setData(0, Qt.ItemDataRole.UserRole, (self._LAZY_TAG, node))
+        placeholder.setFlags(
+            placeholder.flags()
+            & ~Qt.ItemFlag.ItemIsDragEnabled
+            & ~Qt.ItemFlag.ItemIsDropEnabled
+            & ~Qt.ItemFlag.ItemIsSelectable
+        )
         italic = placeholder.font(0)
         italic.setItalic(True)
         placeholder.setFont(0, italic)
@@ -1617,6 +2226,16 @@ class FolderSmithPro(QMainWindow):
             parent_item.addChild(item)
             if child.is_folder and child.children:
                 item.addChild(self._make_placeholder(child))
+                # This folder's real children aren't materialized as items
+                # yet - only the placeholder stands in for them. Moving
+                # this item, or dropping something new into it, right now
+                # would silently drop or orphan everything the placeholder
+                # represents when the tree gets read back into text, so
+                # both are disabled until it's been expanded (see
+                # _on_tree_item_expanded, which turns them back on).
+                item.setFlags(
+                    item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled & ~Qt.ItemFlag.ItemIsDropEnabled
+                )
 
     def _populate_eager(self, parent_item, parent_node):
         for child in parent_node.children:
@@ -1634,26 +2253,453 @@ class FolderSmithPro(QMainWindow):
             node = data[1]
             item.removeChild(placeholder)
             self._populate_shallow(item, node)
+            # Fully materialized now - safe to drag/drop again.
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+
+    # -- Interactive preview editing -------------------------------------
+    #
+    # The preview tree is editable like a small file explorer: drag an
+    # item onto a folder to move it, right-click for New Folder/New File/
+    # Rename/Delete, or press Delete with items selected. Every one of
+    # these ends the same way - read the tree widget's current shape back
+    # into a Node tree, render it to text, and hand that to
+    # _commit_tree_edit(), which pushes the *previous* text onto the
+    # undo stack and rebuilds the preview fresh from the new text. That
+    # keeps the text box the single source of truth even though the edit
+    # started as a mouse action, so Deep Dive / Simulate / Create Structure
+    # never see anything the preview didn't actually show.
+
+    def _is_placeholder_item(self, item):
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        return isinstance(data, tuple) and data[0] == self._LAZY_TAG
+
+    def _node_from_item(self, item, depth):
+        is_folder = bool(item.data(0, Qt.ItemDataRole.UserRole + 1)) or item.childCount() > 0
+        comment = item.text(1).strip() or None
+        node = Node(name=item.text(0), is_folder=is_folder, depth=depth, comment=comment)
+        for i in range(item.childCount()):
+            child_item = item.child(i)
+            if self._is_placeholder_item(child_item):
+                continue
+            child_node = self._node_from_item(child_item, depth + 1)
+            child_node.parent = node
+            node.children.append(child_node)
+        return node
+
+    def _compute_text_from_tree(self):
+        """Read the preview tree widget's current shape back into text.
+        Returns None if there's no real content (nothing to write back)."""
+        root_item = self._preview_root_item
+        if root_item is None:
+            return None
+        root = Node(name="", is_folder=True, depth=-1)
+        for i in range(root_item.childCount()):
+            child_item = root_item.child(i)
+            if self._is_placeholder_item(child_item):
+                continue
+            node = self._node_from_item(child_item, 0)
+            node.parent = root
+            root.children.append(node)
+        if not root.children:
+            return ""
+        render_style = STYLE_TREE_DIAGRAM if self.tree_style == STYLE_MIXED else self.tree_style
+        return render_structure_text(root, render_style)
+
+    def _commit_tree_edit(self, old_text, new_text):
+        """Shared committer for every interactive preview edit (drag,
+        create, rename, delete, style auto-correction). No-op if nothing
+        actually changed."""
+        if new_text is None or new_text == old_text:
+            return
+        if self._pending_typing_baseline is not None:
+            self._commit_typing_undo_step()
+        # If a typing flush just landed exactly on old_text, that already
+        # recorded the step ending here - don't push the same value again
+        # as a second, redundant undo entry right behind it.
+        if not self._undo_stack or self._undo_stack[-1] != old_text:
+            self._undo_stack.append(old_text)
+        self._redo_stack.clear()
+        self._last_committed_text = new_text
+        self._suspend_undo_capture = True
+        self.input_text.blockSignals(True)
+        self.input_text.setPlainText(new_text)
+        self.input_text.blockSignals(False)
+        self._suspend_undo_capture = False
+        self.update_preview()
+
+    def _snapshot_before_tree_edit(self):
+        self._drag_old_text = self.input_text.toPlainText()
+
+    def _on_tree_edited(self):
+        old_text = getattr(self, "_drag_old_text", self.input_text.toPlainText())
+        new_text = self._compute_text_from_tree()
+        if new_text is None:
+            self.update_preview()
+            return
+        self._commit_tree_edit(old_text, new_text)
+        self.status_bar.showMessage("Moved in preview")
+
+    def _delete_selected_tree_items(self):
+        items = [
+            it for it in self.tree_widget.selectedItems()
+            if it is not self._preview_root_item and not self._is_placeholder_item(it)
+        ]
+        if not items:
+            return
+        # Drop any item whose ancestor is also selected, so removing a
+        # folder doesn't also try to remove (and double-count) its children.
+        selected_ids = {id(it) for it in items}
+        def has_selected_ancestor(it):
+            parent = it.parent()
+            while parent is not None:
+                if id(parent) in selected_ids:
+                    return True
+                parent = parent.parent()
+            return False
+        top_level_selected = [it for it in items if not has_selected_ancestor(it)]
+
+        old_text = self.input_text.toPlainText()
+        for it in top_level_selected:
+            parent = it.parent()
+            (parent or self.tree_widget.invisibleRootItem()).removeChild(it)
+        new_text = self._compute_text_from_tree()
+        count = len(top_level_selected)
+        self._commit_tree_edit(old_text, new_text)
+        self.status_bar.showMessage(
+            f"Deleted {count} item{'s' if count != 1 else ''} from the preview"
+        )
+
+    def _target_folder_item(self, item):
+        """Given the item that was right-clicked (or None, for empty
+        space), return the folder item new children should be created
+        under, and whether that's valid right now."""
+        if item is None or item is self._preview_root_item:
+            return self._preview_root_item
+        if self._is_placeholder_item(item):
+            return None
+        is_folder = bool(item.data(0, Qt.ItemDataRole.UserRole + 1)) or item.childCount() > 0
+        return item if is_folder else item.parent()
+
+    def _show_tree_context_menu(self, pos):
+        if self._preview_root_item is None:
+            return
+        item = self.tree_widget.itemAt(pos)
+        if item is not None and self._is_placeholder_item(item):
+            self.status_bar.showMessage("Expand this folder first")
+            return
+        target = self._target_folder_item(item)
+
+        menu = QMenu(self)
+        act_new_folder = menu.addAction(get_cached_icon("📂", 20), "New Folder")
+        act_new_file = menu.addAction(get_cached_icon("📄", 20), "New File…")
+        act_rename = act_delete = act_convert = None
+        real_item = item if (item is not None and item is not self._preview_root_item) else None
+        if real_item is not None:
+            menu.addSeparator()
+            act_rename = menu.addAction("Rename")
+            is_folder = bool(real_item.data(0, Qt.ItemDataRole.UserRole + 1)) or real_item.childCount() > 0
+            act_convert = menu.addAction("Convert to File…" if is_folder else "Convert to Folder")
+            menu.addSeparator()
+            act_delete = menu.addAction("Delete")
+
+        chosen = menu.exec(self.tree_widget.viewport().mapToGlobal(pos))
+        if chosen is None or target is None:
+            return
+        if chosen is act_new_folder:
+            self._create_child_item(target, is_folder=True)
+        elif chosen is act_new_file:
+            self._create_child_item(target, is_folder=False)
+        elif act_rename is not None and chosen is act_rename:
+            self._rename_item(real_item)
+        elif act_convert is not None and chosen is act_convert:
+            self._convert_item(real_item)
+        elif act_delete is not None and chosen is act_delete:
+            self.tree_widget.clearSelection()
+            real_item.setSelected(True)
+            self.tree_widget.setCurrentItem(real_item)
+            self._delete_selected_tree_items()
+
+    def _convert_item(self, item):
+        """Flip an item between folder and file. Folder-to-file always
+        asks for an extension (folders don't have one); file-to-folder
+        asks whether to drop the existing extension, since a folder
+        conventionally doesn't have one either. Either popup can just be
+        closed/cancelled - that's treated as "leave the name as-is"."""
+        is_folder = bool(item.data(0, Qt.ItemDataRole.UserRole + 1)) or item.childCount() > 0
+        name = item.text(0)
+
+        if is_folder:
+            if item.childCount() == 1 and self._is_placeholder_item(item.child(0)):
+                self.status_bar.showMessage(
+                    "Expand this folder first so its contents aren't lost in the conversion"
+                )
+                return
+            if item.childCount() > 0:
+                reply = QMessageBox.question(
+                    self,
+                    "Convert to File",
+                    f'"{name}" contains {item.childCount()} item(s). Converting it to a '
+                    "file will delete all of them. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+            ext, ok = QInputDialog.getText(
+                self,
+                "Convert to File",
+                f'"{name}" needs a file extension. Enter one (without the dot), '
+                "or close this to leave it without one:",
+                text="txt",
+            )
+            ext = ext.strip().lstrip(".") if ok else ""
+            new_name = f"{name}.{ext}" if ext else name
+
+            old_text = self.input_text.toPlainText()
+            item.takeChildren()
+            item.setText(0, new_name)
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, False)
+            item.setIcon(0, get_cached_icon("📄"))
+            item.setForeground(0, QColor(get_file_color(new_name)))
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
+            new_text = self._compute_text_from_tree()
+            self._commit_tree_edit(old_text, new_text)
+            self.status_bar.showMessage(f"Converted to file: {new_name}")
+        else:
+            base, dot, ext = name.rpartition(".")
+            new_name = name
+            if dot and base:
+                reply = QMessageBox.question(
+                    self,
+                    "Convert to Folder",
+                    f"Remove the file extension \".{ext}\"?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    new_name = base
+
+            old_text = self.input_text.toPlainText()
+            item.setText(0, new_name)
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, True)
+            item.setIcon(0, get_cached_icon("📂"))
+            item.setForeground(0, QColor(get_folder_color(self._item_depth(item))))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDropEnabled)
+            new_text = self._compute_text_from_tree()
+            self._commit_tree_edit(old_text, new_text)
+            self.status_bar.showMessage(f"Converted to folder: {new_name}")
+
+    def _item_depth(self, item):
+        """Depth of an item relative to the project root (the invisible
+        "Project Structure" wrapper is depth -1, its direct children are
+        depth 0) - only used to pick a sensible folder color for newly
+        created items."""
+        depth = -1
+        node = item
+        while node is not None and node is not self._preview_root_item:
+            depth += 1
+            node = node.parent()
+        return depth
+
+    def _create_child_item(self, parent_item, is_folder):
+        kind = "Folder" if is_folder else "File"
+        default_name = "New Folder" if is_folder else "new_file.txt"
+        name, ok = QInputDialog.getText(
+            self, f"New {kind}", f"{kind} name:", text=default_name
+        )
+        if not ok:
+            return
+        name = name.strip().rstrip("/").strip()
+        if not name:
+            return
+
+        old_text = self.input_text.toPlainText()
+        depth = self._item_depth(parent_item) + 1
+        node = Node(name=name, is_folder=is_folder, depth=depth)
+        new_item = self._build_item_for_node(node)
+        parent_item.addChild(new_item)
+        parent_item.setExpanded(True)
+        new_text = self._compute_text_from_tree()
+        self._commit_tree_edit(old_text, new_text)
+        self.status_bar.showMessage(f"Added {kind.lower()}: {name}")
+
+    def _rename_item(self, item):
+        if item is None or item is self._preview_root_item:
+            return
+        current_name = item.text(0)
+        new_name, ok = QInputDialog.getText(self, "Rename", "New name:", text=current_name)
+        if not ok:
+            return
+        new_name = new_name.strip().rstrip("/").strip()
+        if not new_name or new_name == current_name:
+            return
+        old_text = self.input_text.toPlainText()
+        item.setText(0, new_name)
+        new_text = self._compute_text_from_tree()
+        self._commit_tree_edit(old_text, new_text)
+        self.status_bar.showMessage(f"Renamed to: {new_name}")
+
+    # -- Unified undo/redo -------------------------------------------------
+
+    def _on_input_text_changed(self):
+        if not self._suspend_undo_capture:
+            if self._pending_typing_baseline is None:
+                self._pending_typing_baseline = self._last_committed_text
+            self._typing_debounce.start()
+        self.update_preview()
+
+    def _commit_typing_undo_step(self):
+        current = self.input_text.toPlainText()
+        if self._pending_typing_baseline is not None and self._pending_typing_baseline != current:
+            self._undo_stack.append(self._pending_typing_baseline)
+            self._redo_stack.clear()
+            self._last_committed_text = current
+        self._pending_typing_baseline = None
+        # Safety net: catches hand-typed stray tree characters, IME input,
+        # or any paste route insertFromMimeData doesn't see. The main path
+        # for a Ctrl+V paste is _on_text_pasted, which corrects immediately
+        # instead of waiting out this pause.
+        self._apply_enforced_style_correction()
+
+    def _on_enforce_toggled(self, _state):
+        self.update_preview()
+        self._apply_enforced_style_correction()
+
+    def _on_text_pasted(self):
+        self._apply_enforced_style_correction()
+
+    def _apply_enforced_style_correction(self):
+        """When "Enforce this style" is on, make sure the text actually
+        looks like the enforced style instead of just being parsed as if
+        it were - e.g. pasting a tree diagram while Plain indented is
+        enforced should rewrite it into real plain indentation, not just
+        silently treat the │├└ characters as noise while leaving them
+        sitting in the box looking like nothing happened. Mixed is left
+        alone since it has no single canonical text form to rewrite into."""
+        if not self.enforce_style_cb.isChecked() or self.tree_style == STYLE_MIXED:
+            return
+        text = self.input_text.toPlainText()
+        if not text.strip():
+            return
+        root_node, _ = self._parse(text)
+        if not root_node.children:
+            return
+        corrected = render_structure_text(root_node, self.tree_style)
+        if corrected.strip() == text.strip():
+            return
+        self._commit_tree_edit(text, corrected)
+        self.status_bar.showMessage("Auto-corrected text to match the enforced style")
+
+    def _restore_text(self, text):
+        self._suspend_undo_capture = True
+        self.input_text.blockSignals(True)
+        self.input_text.setPlainText(text)
+        self.input_text.blockSignals(False)
+        self._suspend_undo_capture = False
+        self._last_committed_text = text
+        self.update_preview()
+
+    def _do_undo(self):
+        if self._pending_typing_baseline is not None:
+            self._commit_typing_undo_step()
+        if not self._undo_stack:
+            self.status_bar.showMessage("Nothing to undo")
+            return
+        current = self.input_text.toPlainText()
+        previous = self._undo_stack.pop()
+        self._redo_stack.append(current)
+        self._restore_text(previous)
+        self.status_bar.showMessage(f"Undid last change ({len(self._undo_stack)} more available)")
+
+    def _do_redo(self):
+        if not self._redo_stack:
+            self.status_bar.showMessage("Nothing to redo")
+            return
+        current = self.input_text.toPlainText()
+        next_text = self._redo_stack.pop()
+        self._undo_stack.append(current)
+        self._restore_text(next_text)
+        self.status_bar.showMessage(f"Redid change ({len(self._redo_stack)} more available)")
+
+    def eventFilter(self, obj, event):
+        if obj is self.input_text and event.type() == QEvent.Type.KeyPress:
+            if event.matches(QKeySequence.StandardKey.Undo):
+                self._do_undo()
+                return True
+            if event.matches(QKeySequence.StandardKey.Redo):
+                self._do_redo()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _ignore_connectors(self):
+        """True only when the user has explicitly locked in Plain indented
+        via the Enforce checkbox - the one case where tree-diagram glyphs
+        (│├└) in the text should be treated as plain noise instead of
+        structural signals."""
+        return self.enforce_style_cb.isChecked() and self.tree_style == STYLE_PLAIN_INDENT
+
+    def _smart_mixed(self):
+        """True when the current style is Mixed (auto-detected, or
+        manually picked from the dropdown) - the only case where bare
+        tree connectors get resolved relative to context instead of
+        taken at face value."""
+        return self.tree_style == STYLE_MIXED
+
+    def _parse(self, text):
+        """Single place every call site parses input text from, so the
+        Enforce checkbox and Mixed-style handling can never drift out of
+        sync between the preview, Deep Dive, Simulate, and actual creation."""
+        return parse_structure(
+            text,
+            ignore_connectors=self._ignore_connectors(),
+            smart_mixed=self._smart_mixed(),
+        )
+
+    def _sync_style_dropdown(self, structure):
+        """Auto-detect how the currently typed/pasted text is formatted
+        and update the Tree style dropdown to match - unless the user has
+        checked "Enforce tree style", in which case their manual choice
+        always wins and auto-detection is skipped entirely."""
+        if self.enforce_style_cb.isChecked():
+            return None
+        detected = detect_structure_style(structure)
+        if detected is None or detected == self.tree_style:
+            return detected
+        self.tree_style = detected
+        idx = self.tree_style_combo.findData(detected)
+        if idx != -1:
+            self.tree_style_combo.blockSignals(True)
+            self.tree_style_combo.setCurrentIndex(idx)
+            self.tree_style_combo.blockSignals(False)
+        return detected
 
     def update_preview(self):
         structure = self.input_text.toPlainText().strip()
         self.tree_widget.clear()
+        self._preview_root_item = None
 
         if not structure:
             self.tree_diagram_detected = False
             return
 
-        if any(char in structure for char in ["├", "│", "└"]):
-            self.tree_diagram_detected = True
-        else:
-            self.tree_diagram_detected = False
+        detected_style = self._sync_style_dropdown(structure)
+        self.tree_diagram_detected = any(char in structure for char in ["├", "│", "└"])
 
-        root_node, indent_unit = parse_structure(structure)
+        root_node, indent_unit = self._parse(structure)
         total_nodes = count_nodes(root_node)
 
         root_item = QTreeWidgetItem(self.tree_widget)
         root_item.setText(0, "Project Structure")
         root_item.setIcon(0, get_cached_icon("📁"))
+        # The wrapper node itself can't be dragged or deleted, but items
+        # CAN be dropped directly onto it to become top-level project items.
+        root_item.setFlags(
+            (root_item.flags() | Qt.ItemFlag.ItemIsDropEnabled)
+            & ~Qt.ItemFlag.ItemIsDragEnabled
+            & ~Qt.ItemFlag.ItemIsSelectable
+        )
+        self._preview_root_item = root_item
 
         if total_nodes > LAZY_LOAD_THRESHOLD:
             self._populate_shallow(root_item, root_node)
@@ -1669,6 +2715,12 @@ class FolderSmithPro(QMainWindow):
         if total_nodes > LAZY_LOAD_THRESHOLD:
             self.status_bar.showMessage(
                 f"Ready. {total_nodes:,} items - expand a folder in the preview to load it."
+            )
+        elif detected_style == STYLE_MIXED:
+            self.status_bar.showMessage(
+                "Mixed formatting detected (tree connectors + plain indenting together) - "
+                "nesting shown is best-effort. Check the preview, or pick Tree diagram / "
+                "Plain indented above to normalize the text."
             )
         elif self.tree_diagram_detected:
             self.status_bar.showMessage(
@@ -1691,7 +2743,7 @@ class FolderSmithPro(QMainWindow):
         if not text.strip():
             QMessageBox.information(self, "Nothing to show", "Enter a structure first.")
             return
-        root_node, _ = parse_structure(text)
+        root_node, _ = self._parse(text)
         if not root_node.children:
             QMessageBox.information(
                 self, "Nothing to show", "No valid folders or files were found in the input."
@@ -1737,6 +2789,8 @@ class FolderSmithPro(QMainWindow):
             root_path,
             self.delete_cb.isChecked(),
             self.comments_cb.isChecked(),
+            self._ignore_connectors(),
+            self._smart_mixed(),
         )
 
         self.structure_worker.progress.connect(self.progress_bar.setValue)
@@ -1753,7 +2807,7 @@ class FolderSmithPro(QMainWindow):
             return
 
         text = self.input_text.toPlainText()
-        root_node, _ = parse_structure(text)
+        root_node, _ = self._parse(text)
         folders, files, comments = compute_stats(root_node)
         extract = self.comments_cb.isChecked()
 
@@ -1846,7 +2900,7 @@ class FolderSmithPro(QMainWindow):
         text = self.input_text.toPlainText().strip()
         if not text:
             return
-        root_node, _ = parse_structure(text)
+        root_node, _ = self._parse(text)
         if not root_node.children:
             return
         rendered = render_structure_text(root_node, self.tree_style)
@@ -2007,6 +3061,8 @@ class FolderSmithPro(QMainWindow):
                 temp_dir,
                 True,
                 self.comments_cb.isChecked(),
+                self._ignore_connectors(),
+                self._smart_mixed(),
             )
 
             self.structure_worker.progress.connect(self.progress_bar.setValue)
@@ -2129,7 +3185,11 @@ class FolderSmithPro(QMainWindow):
                 <p><strong> Features:</strong></p>
                 <ul>
                     <li> Import Folder - scan any real folder on disk into an editable project structure</li>
-                    <li> Two tree styles (tree diagram / plain indented), toggle any time</li>
+                    <li> Three tree styles - Tree diagram, Plain indented, and auto-detected Mixed - the dropdown switches itself to match what you type</li>
+                    <li> "Enforce this style" checkbox to lock the style and stop auto-detection when you need to</li>
+                    <li> Interactive preview - drag items to move them, right-click to add/rename/convert/delete, Delete key removes a selection</li>
+                    <li> VS Code-style multi-cursor editing in the text box (Alt+click, Alt+Shift+click, Alt+Up/Down, Alt+Shift+Up/Down) - see Help &gt; Shortcuts</li>
+                    <li> Unlimited undo/redo (Ctrl+Z / Ctrl+Y) covering typing and every preview edit alike</li>
                     <li> Ready-made presets for common project types</li>
                     <li>variety of comment extraction (#, //, /* */, &lt;!-- --&gt;, --, ;, %)</li>
                     <li> Deep Dive breakdown of every folder and file</li>
@@ -2174,9 +3234,51 @@ class FolderSmithPro(QMainWindow):
         folders on demand, so importing a big folder never freezes the app.</p>
 
         <h2>Tree Style</h2>
-        <p>Use the <b>Tree style</b> dropdown to switch how a structure is
-        written - as a connector-style tree diagram (├── └──) or as plain
-        indented text. Switching it re-renders whatever is currently loaded.</p>
+        <p>The <b>Tree style</b> dropdown shows how a structure is written -
+        as a connector-style tree diagram (├── └──), as plain indented text,
+        or <b>Mixed</b>, which means the two are combined in what you typed.
+        It switches itself automatically to match whatever you type or
+        paste, so you don't have to set it by hand. Pick a style from the
+        dropdown yourself at any time to reformat the current text into it.</p>
+
+        <p>If you'd rather the dropdown stopped auto-switching - for example
+        you're typing plain indentation but your text happens to contain
+        stray ├ └ │ characters - tick <b>Enforce this style</b> next to it.
+        With Enforce on and Plain indented selected, any tree characters in
+        the text are treated as ordinary text, never as structure.</p>
+
+        <p>For <b>Mixed</b> text, nesting is resolved as best as it
+        reasonably can be from the connectors and indentation present, but
+        a line with absolutely no indentation and no connector carries no
+        nesting information at all - guessing there would be wrong as often
+        as it's right, so those lines stay at the top level rather than a
+        confident-looking guess. Add a bit of indentation or a connector to
+        any line that needs to nest, and it will always place correctly.</p>
+
+        <h2>Interactive Preview</h2>
+        <p>The Structure Preview on the right isn't just a read-only view -
+        it works like a small file explorer:</p>
+        <ul>
+            <li><b>Drag</b> a file or folder onto another folder to move it
+            there. Drop it on empty space, or on the "Project Structure"
+            heading at the top, to make it a top-level item.</li>
+            <li><b>Right-click</b> anywhere for <b>New Folder</b> or
+            <b>New File…</b> (type any name, with any extension you like).
+            Right-click an existing item for <b>Rename</b> or
+            <b>Delete</b> as well.</li>
+            <li>Select one or more items and press <b>Delete</b> to remove
+            them.</li>
+        </ul>
+        <p>Every one of these updates the text on the left immediately -
+        the preview and the text always describe the same structure.</p>
+
+        <h2>Undo / Redo</h2>
+        <p><b>Ctrl+Z</b> and <b>Ctrl+Y</b> (or the ↩ / ↪ buttons above the
+        preview) undo and redo typing and interactive preview edits alike,
+        as one shared history with no limit on how far back you can go.
+        Typing is grouped into one undo step per pause, the way any text
+        editor does it; each drag, create, rename, or delete is its own
+        step.</p>
 
         <h2>Presets</h2>
         <p>Pick a ready-made layout from the <b>Preset</b> dropdown for common
@@ -2222,6 +3324,55 @@ project/
         msg = ModernMessageBox(self)
         msg.setWindowTitle("Project Structure Help")
         msg.setText(help_text)
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
+
+    def show_shortcuts(self):
+        shortcuts_text = """
+        <html>
+        <center>
+        <h1>Shortcuts</h1>
+
+        <h2>Undo / Redo</h2>
+        <table style="margin:0 auto;" cellpadding="4">
+        <tr><td><b>Ctrl+Z</b></td><td>Undo - typing and preview edits alike</td></tr>
+        <tr><td><b>Ctrl+Y</b></td><td>Redo</td></tr>
+        </table>
+
+        <h2>Editing (in the structure text box)</h2>
+        <table style="margin:0 auto;" cellpadding="4">
+        <tr><td><b>Alt+Click</b></td><td>Add a secondary cursor - click an existing one again to remove it</td></tr>
+        <tr><td><b>Alt+Shift+Click</b></td><td>Add a column of cursors from the current line to the clicked line/column</td></tr>
+        <tr><td><b>Esc</b></td><td>Clear all secondary cursors</td></tr>
+        <tr><td><b>Alt+Up / Alt+Down</b></td><td>Move the current line up/down</td></tr>
+        <tr><td><b>Alt+Shift+Up / Alt+Shift+Down</b></td><td>Duplicate the current line up/down</td></tr>
+        <tr><td><b>Home</b></td><td>First press: first non-whitespace character. Press again: column 0</td></tr>
+        </table>
+
+        <h2>Structure Preview</h2>
+        <table style="margin:0 auto;" cellpadding="4">
+        <tr><td><b>Drag &amp; drop</b></td><td>Move a file/folder to a new parent</td></tr>
+        <tr><td><b>Right-click</b></td><td>New Folder, New File, Rename, Convert, Delete</td></tr>
+        <tr><td><b>Delete</b></td><td>Remove the selected item(s)</td></tr>
+        </table>
+
+        <h2>Other</h2>
+        <table style="margin:0 auto;" cellpadding="4">
+        <tr><td><b>Ctrl+I</b></td><td>Import Folder</td></tr>
+        <tr><td><b>Ctrl+Shift+C</b></td><td>Clear</td></tr>
+        </table>
+
+        <p style="max-width:460px;margin:16px auto 0;color:#aaa;font-size:12px;">
+        Multi-cursor editing works on carets, not highlighted column
+        selections - each Alt-click/Alt-Shift-click spot is a place to
+        type, not a block of selected text.
+        </p>
+        </center>
+        </html>
+        """
+        msg = ModernMessageBox(self)
+        msg.setWindowTitle("Shortcuts")
+        msg.setText(shortcuts_text)
         msg.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg.exec()
 
