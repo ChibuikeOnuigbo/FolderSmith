@@ -1,3 +1,4 @@
+# created by Chibuike, missing  some responsive features. There might still be bugs. I will improve regularly
 import sys
 import os
 import re
@@ -212,8 +213,7 @@ _ACTION_ICON_CACHE = {}
 def get_icon_for_action(name, fallback_emoji):
     """Load an icon from the assets/ folder (undo.svg, redo.svg, ...) next
     to this script - falling back to a rendered emoji glyph if the file
-    isn't there, so a missing asset folder never breaks a button, it just
-    looks a little plainer."""
+    isn't there, i might have to  improve tis  later"""
     if name in _ACTION_ICON_CACHE:
         return _ACTION_ICON_CACHE[name]
     path = get_asset_path(f"{name}.svg")
@@ -1519,7 +1519,7 @@ class StructureTextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
-# The live preview tree, made interactive.
+# The live preview tree.
 #
 # QTreeWidget's built-in "InternalMove" drag mode already does the visual
 # work of letting an item be dragged onto a new parent - but it doesn't
@@ -2837,7 +2837,7 @@ class FolderSmithPro(QMainWindow):
 
     def import_folder(self):
         """Scan a real folder on disk and turn it into a project structure
-        - the other direction from Create Structure. Scanning runs on a
+        ::the other direction from Create Structure. Scanning runs on a
         background thread (FolderScanWorker) so importing a large folder
         never freezes the window."""
         if self.scan_worker is not None:

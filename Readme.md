@@ -100,10 +100,14 @@ Note: cursor spots do not make a block pick, just many type spots.
 
 ![FolderSmith Pro sample](output.png)
 
+## Demo
+
+![FolderSmith Pro demo](output.gif)
+
 ## Help
 
 - Email: [studiocoding09@gmail.com](mailto:studiocoding09@gmail.com)
-- More help: (https://chibuikeonuigbo.github.io/Support_Page/)
+- Support: (https://chibuikeonuigbo.github.io/Support_Page/)
 
 ## Rights
 
