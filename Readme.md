@@ -111,6 +111,3 @@ Note: cursor spots do not make a block pick, just many type spots.
 - Email: [studiocoding09@gmail.com](mailto:studiocoding09@gmail.com)
 - Support: (https://chibuikeonuigbo.github.io/Support_Page/)
 
-## Rights
-
-(c) 2025 FolderSmith Pro. All rights kept.
