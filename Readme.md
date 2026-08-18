@@ -102,7 +102,9 @@ Note: cursor spots do not make a block pick, just many type spots.
 
 ## Demo
 
-![FolderSmith Pro demo](output.gif)
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/13bbee22-79e8-4b32-8c2a-1f344418acc0" width="80%" controls></video>
+</p>
 
 ## Help
 
